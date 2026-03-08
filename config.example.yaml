@@ -1,0 +1,68 @@
+# viewport — example configuration
+# Copy this file to config.yaml and edit as needed.
+# Run: python3 main.py --config config.yaml
+
+# ---------------------------------------------------------------------------
+# Display settings
+# ---------------------------------------------------------------------------
+display:
+  width: 1920     # output resolution width  (must match your display)
+  height: 1080    # output resolution height (must match your display)
+
+# ---------------------------------------------------------------------------
+# Decoder settings
+# ---------------------------------------------------------------------------
+decoder:
+  # Prefer hardware-accelerated decoding (v4l2h264dec / v4l2h265dec).
+  # Falls back to software (avdec_h264 / avdec_h265) if hardware is unavailable.
+  prefer_hardware: true
+
+# ---------------------------------------------------------------------------
+# Cells — exactly 6 entries (3 rows × 2 columns).
+#
+# Grid layout:
+#   ┌────────────┬────────────┐
+#   │  cells[0]  │  cells[1]  │  row 0
+#   ├────────────┼────────────┤
+#   │  cells[2]  │  cells[3]  │  row 1
+#   ├────────────┼────────────┤
+#   │  cells[4]  │  cells[5]  │  row 2
+#   └────────────┴────────────┘
+#
+# Each cell supports:
+#   streams:            list of RTSP URLs (required, at least one)
+#   rotation_interval:  seconds between stream switches (default: 0 = disabled)
+#   codec:              h264 (default) or h265
+#
+# If you configure fewer than 6 cells, the remaining cells show black.
+# ---------------------------------------------------------------------------
+cells:
+  # Cell 0 — top-left: single stream, no rotation
+  - streams:
+      - rtsp://192.168.1.100/stream1
+
+  # Cell 1 — top-right: rotates between two cameras every 30 seconds
+  - streams:
+      - rtsp://192.168.1.101/stream1
+      - rtsp://192.168.1.102/stream1
+    rotation_interval: 30
+
+  # Cell 2 — middle-left: H.265 / HEVC stream
+  - streams:
+      - rtsp://192.168.1.103/stream1
+    codec: h265
+
+  # Cell 3 — middle-right: single stream
+  - streams:
+      - rtsp://192.168.1.104/stream1
+
+  # Cell 4 — bottom-left: rotates among three cameras every 15 seconds
+  - streams:
+      - rtsp://192.168.1.105/stream1
+      - rtsp://192.168.1.106/stream1
+      - rtsp://192.168.1.107/stream1
+    rotation_interval: 15
+
+  # Cell 5 — bottom-right: single stream with RTSP credentials in the URL
+  - streams:
+      - rtsp://admin:password@192.168.1.108/stream1

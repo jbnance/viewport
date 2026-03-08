@@ -1,0 +1,38 @@
+[Unit]
+Description=viewport — headless RTSP multi-stream display
+Documentation=https://github.com/jbnance/viewport
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=video
+
+# Adjust the path to your config file as needed
+ExecStart=/usr/bin/python3 /opt/viewport/main.py --config /etc/viewport/config.yaml
+
+# Restart on any failure (including stream errors), with a short delay
+Restart=on-failure
+RestartSec=5
+
+# Allow direct DRM/KMS access
+# The 'video' group provides access to /dev/dri/card* on Raspberry Pi OS
+# If needed, also add 'render' group: supplementary_groups=video render
+
+# Environment — adjust GST_DEBUG for more/less verbose logging
+Environment=GST_DEBUG=2
+# Optionally select a specific DRM connector:
+# ExecStart=/usr/bin/python3 /opt/viewport/main.py --config /etc/viewport/config.yaml --connector-id 42
+
+# Ensure the process has access to the GPU device
+DeviceAllow=/dev/dri rw
+DeviceAllow=/dev/video* rw
+PrivateNetwork=no
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=viewport
+
+[Install]
+WantedBy=multi-user.target
