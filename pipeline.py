@@ -7,7 +7,6 @@ kmssink output.  Hands out pre-allocated compositor sink pads to Cell objects.
 from __future__ import annotations
 
 import logging
-import sys
 from typing import Optional
 
 import gi
@@ -95,13 +94,11 @@ class ViewportPipeline:
             pad.set_property("height", ch)
             self._compositor_pads.append(pad)
 
-        # --- output: videorate → capsfilter → kmssink ---
-        videorate = _make("videorate", "videorate")
-
-        caps_str = (
-            f"video/x-raw,width={cfg.display.width},height={cfg.display.height},"
-            f"framerate=30/1"
-        )
+        # --- output: capsfilter → kmssink ---
+        # videorate is intentionally absent: enforcing a fixed framerate scans
+        # every composited frame and duplicates/drops to hit exactly 30 fps,
+        # wasting CPU for no visual benefit on a security display.
+        caps_str = f"video/x-raw,width={cfg.display.width},height={cfg.display.height}"
         out_capsfilter = _make("capsfilter", "out_capsfilter")
         out_capsfilter.set_property("caps", Gst.Caps.from_string(caps_str))
 
@@ -111,12 +108,10 @@ class ViewportPipeline:
         # Allow kmssink to render without strict sync to avoid underruns on slow streams
         kmssink.set_property("sync", False)
 
-        self.pipeline.add(compositor, videorate, out_capsfilter, kmssink)
+        self.pipeline.add(compositor, out_capsfilter, kmssink)
 
-        if not compositor.link(videorate):
-            raise RuntimeError("Failed to link compositor → videorate")
-        if not videorate.link(out_capsfilter):
-            raise RuntimeError("Failed to link videorate → out_capsfilter")
+        if not compositor.link(out_capsfilter):
+            raise RuntimeError("Failed to link compositor → out_capsfilter")
         if not out_capsfilter.link(kmssink):
             raise RuntimeError("Failed to link out_capsfilter → kmssink")
 

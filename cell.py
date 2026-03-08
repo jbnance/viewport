@@ -12,15 +12,14 @@ The branch topology for each active stream is:
                                                  v4l2h264dec  (hw preferred)
                                                  or avdec_h264 (sw fallback)
                                                       │
-                                                 videoconvert
-                                                      │
-                                                  videoscale
-                                                      │
-                                           capsfilter (cell WxH, BGRx)
-                                                      │
                                                    queue
                                                       │
                                             compositor sink pad
+
+The compositor scales each input to the cell's width/height via its pad
+properties, so no separate videoconvert, videoscale, or capsfilter is needed
+in each branch — removing those 3 elements per cell saves 18 software
+processing stages across the full 6-cell pipeline.
 
 Stream rotation runs directly on the GLib main loop thread (the GLib timeout
 callback), so teardown and reconnect are safe — no pad probes are used.
@@ -170,14 +169,15 @@ class Cell:
 
         src = self._make("rtspsrc", f"src_{suffix}")
         src.set_property("location", url)
-        src.set_property("latency", 200)          # 200ms jitter buffer
+        src.set_property("latency", 100)          # 100ms jitter buffer (was 200)
+        src.set_property("drop-on-latency", True) # drop stale frames instead of stalling
         src.set_property("do-rtcp", False)        # reduce network overhead
         src.set_property("protocols", 0x4)        # prefer TCP (4 = GST_RTSP_LOWER_TRANS_TCP)
         src.set_property("retry", 5)
 
         in_queue = self._make("queue", f"inq_{suffix}")
-        in_queue.set_property("max-size-buffers", 5)
-        in_queue.set_property("leaky", 2)         # 2 = downstream (drop old buffers)
+        in_queue.set_property("max-size-buffers", 2)  # was 5; smaller = less buffering
+        in_queue.set_property("leaky", 2)             # 2 = downstream (drop old buffers)
 
         if codec == "h265":
             depay = self._make("rtph265depay", f"depay_{suffix}")
@@ -189,21 +189,15 @@ class Cell:
         decoder = self._make_decoder(codec)
         decoder.set_name(f"dec_{suffix}")
 
-        videoconvert = self._make("videoconvert", f"vconv_{suffix}")
-        videoscale = self._make("videoscale", f"vscale_{suffix}")
-
-        caps_str = (
-            f"video/x-raw,format=BGRx,"
-            f"width={self.cell_width},height={self.cell_height}"
-        )
-        capsfilter = self._make("capsfilter", f"caps_{suffix}")
-        capsfilter.set_property("caps", Gst.Caps.from_string(caps_str))
-
+        # No videoconvert/videoscale/capsfilter here — the compositor scales
+        # each input to the cell dimensions via its sink-pad width/height
+        # properties, handling color conversion internally.  Adding those
+        # elements would cause two software conversions per frame per cell.
         out_queue = self._make("queue", f"outq_{suffix}")
         out_queue.set_property("max-size-buffers", 2)
         out_queue.set_property("leaky", 2)
 
-        branch = [src, in_queue, depay, parser, decoder, videoconvert, videoscale, capsfilter, out_queue]
+        branch = [src, in_queue, depay, parser, decoder, out_queue]
 
         # rtspsrc has dynamic pads — connect via signal
         src.connect("pad-added", self._on_pad_added, in_queue)
@@ -216,7 +210,7 @@ class Cell:
 
         rtspsrc (branch[0]) links to in_queue (branch[1]) dynamically via pad-added.
         """
-        # branch: [rtspsrc, in_queue, depay, parser, decoder, vconv, vscale, caps, out_queue]
+        # branch: [rtspsrc, in_queue, depay, parser, decoder, out_queue]
         static_chain = branch[1:]  # everything after rtspsrc
         for i in range(len(static_chain) - 1):
             if not static_chain[i].link(static_chain[i + 1]):
