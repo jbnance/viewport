@@ -74,6 +74,18 @@ class ViewportPipeline:
         compositor = _make("compositor", "compositor")
         compositor.set_property("background", 1)  # 1 = black background
 
+        # Without this, the compositor waits for a buffer on *every* sink pad
+        # before producing its first output frame.  If even one camera is slow
+        # to deliver its first keyframe, all six cells are frozen.
+        # Property added in GStreamer 1.20; silently skipped on 1.18.
+        if hasattr(compositor.props, "ignore_inactive_pads"):
+            compositor.set_property("ignore-inactive-pads", True)
+        else:
+            log.debug(
+                "compositor: ignore-inactive-pads not available (GStreamer < 1.20); "
+                "all pads must deliver a frame before output begins"
+            )
+
         # Pre-allocate one sink pad per cell and configure its position/size.
         # request_pad_simple() was added in GStreamer 1.20; fall back to
         # get_request_pad() for GStreamer 1.18 (Raspberry Pi OS Bullseye).
