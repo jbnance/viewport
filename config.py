@@ -20,6 +20,14 @@ CELL_COUNT = GRID_ROWS * GRID_COLS
 class DisplayConfig:
     width: int = 1920
     height: int = 1080
+    # Target compositor output framerate.  Without an explicit framerate the
+    # GstVideoAggregator compositor waits for all 6 independent RTSP clocks to
+    # produce frames at the *same* timestamp before compositing, which almost
+    # never happens and results in <1 fps output despite available CPU headroom.
+    # Setting this to the camera stream framerate (or any reasonable value)
+    # switches the compositor to a fixed-interval timer that composites
+    # whatever frame each pad currently has every 1/framerate seconds.
+    framerate: int = 15
 
     @property
     def cell_width(self) -> int:
@@ -90,6 +98,7 @@ def load_config(path: str) -> AppConfig:
     display = DisplayConfig(
         width=int(disp_raw.get("width", 1920)),
         height=int(disp_raw.get("height", 1080)),
+        framerate=int(disp_raw.get("framerate", 15)),
     )
 
     # Decoder
@@ -118,9 +127,10 @@ def load_config(path: str) -> AppConfig:
 
     cfg = AppConfig(display=display, decoder=decoder, cells=cells)
     log.info(
-        "Loaded config: %dx%d display, %d cell(s) configured",
+        "Loaded config: %dx%d @ %d fps display, %d cell(s) configured",
         display.width,
         display.height,
+        display.framerate,
         sum(1 for c in cfg.cells if c is not None),
     )
     return cfg

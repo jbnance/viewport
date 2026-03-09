@@ -107,10 +107,21 @@ class ViewportPipeline:
             self._compositor_pads.append(pad)
 
         # --- output: capsfilter → kmssink ---
-        # videorate is intentionally absent: enforcing a fixed framerate scans
-        # every composited frame and duplicates/drops to hit exactly 30 fps,
-        # wasting CPU for no visual benefit on a security display.
-        caps_str = f"video/x-raw,width={cfg.display.width},height={cfg.display.height}"
+        # The framerate here is critical: without it GstVideoAggregator has no
+        # timer-based aggregation cycle and instead waits for all 6 input pads to
+        # supply frames at the *same* PTS before compositing.  With 6 independent
+        # RTSP clocks that never perfectly align, the compositor produces <1 fps
+        # output despite 50-60% available CPU.  Setting framerate=N/1 switches the
+        # compositor to fire every 1/N seconds and composite whatever frame each
+        # pad currently has — the correct behaviour for a live multi-source display.
+        # videorate is not needed: the compositor itself throttles output to exactly
+        # cfg.display.framerate fps once the sink caps include a framerate.
+        caps_str = (
+            f"video/x-raw"
+            f",width={cfg.display.width}"
+            f",height={cfg.display.height}"
+            f",framerate={cfg.display.framerate}/1"
+        )
         out_capsfilter = _make("capsfilter", "out_capsfilter")
         out_capsfilter.set_property("caps", Gst.Caps.from_string(caps_str))
 
