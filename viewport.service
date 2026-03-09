@@ -10,7 +10,7 @@ User=pi
 Group=video
 
 # Adjust the path to your config file as needed
-ExecStart=/usr/bin/python3 /opt/viewport/main.py --config /etc/viewport/config.yaml
+ExecStart=/usr/bin/python3 /opt/viewport/main.py /etc/viewport/config.yaml
 
 # Restart on any failure (including stream errors), with a short delay
 Restart=on-failure
@@ -23,7 +23,8 @@ RestartSec=5
 # Environment — adjust GST_DEBUG for more/less verbose logging
 Environment=GST_DEBUG=2
 # Optionally select a specific DRM connector:
-# ExecStart=/usr/bin/python3 /opt/viewport/main.py --config /etc/viewport/config.yaml --connector-id 42
+# Set connector_id: <id> under the display: section in /etc/viewport/config.yaml
+# Run `modetest -c` on the Pi to list available connector IDs.
 
 # Ensure the process has access to the GPU device
 DeviceAllow=/dev/dri rw
