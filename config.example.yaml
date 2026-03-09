@@ -1,6 +1,12 @@
 # viewport — example configuration
 # Copy this file to config.yaml and edit as needed.
-# Run: python3 main.py --config config.yaml
+# Run: python3 main.py config.yaml
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+# Verbosity: DEBUG | INFO | WARNING | ERROR  (default: INFO)
+log_level: INFO
 
 # ---------------------------------------------------------------------------
 # Display settings
@@ -12,6 +18,8 @@ display:
                   # stream framerate (UniFi Protect high-quality = 15 or 20 fps).
                   # This MUST be set: without it the compositor waits for all 6
                   # RTSP clocks to agree on a timestamp, producing <1 fps output.
+  # connector_id: 42  # DRM connector ID for kmssink.  Omit for auto-detect.
+                      # Run `modetest -c` on the Pi to list available IDs.
 
 # ---------------------------------------------------------------------------
 # Decoder settings

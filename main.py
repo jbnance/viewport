@@ -5,9 +5,11 @@ Displays up to 6 RTSP streams in a 3×2 grid on a 1080p display using
 GStreamer's DRM/KMS sink (no X11 or Wayland required).
 
 Usage:
-    python3 main.py --config config.yaml
-    python3 main.py --config config.yaml --connector-id 42
-    python3 main.py --config config.yaml --log-level DEBUG
+    python3 main.py config.yaml
+
+All settings (log level, display options, decoder preferences, streams) are
+read from the YAML configuration file.  See config.example.yaml for a
+documented reference.
 """
 
 from __future__ import annotations
@@ -16,7 +18,6 @@ import argparse
 import logging
 import signal
 import sys
-from typing import Optional
 
 import gi
 
@@ -43,48 +44,41 @@ def _parse_args() -> argparse.Namespace:
         description="viewport: headless RTSP grid display for Raspberry Pi"
     )
     p.add_argument(
-        "--config",
-        required=True,
-        metavar="FILE",
-        help="Path to YAML configuration file",
-    )
-    p.add_argument(
-        "--connector-id",
-        type=int,
-        default=None,
-        metavar="N",
-        help=(
-            "DRM connector ID to use for output (default: auto-detect). "
-            "List connectors with: modetest -c"
-        ),
-    )
-    p.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging verbosity (default: INFO)",
+        "config",
+        metavar="CONFIG",
+        help="Path to YAML configuration file (see config.example.yaml)",
     )
     return p.parse_args()
 
 
 def main() -> int:
     args = _parse_args()
-    _setup_logging(args.log_level)
+
+    # Bootstrap with WARNING until the config file tells us the real level.
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
     log = logging.getLogger("main")
 
     # GStreamer init — must happen before any Gst calls
     Gst.init(None)
 
-    # Load configuration
+    # Load configuration (determines log level, connector id, streams, …)
     try:
         config = load_config(args.config)
     except (FileNotFoundError, ValueError) as exc:
         log.error("Configuration error: %s", exc)
         return 1
 
+    # Apply the log level from the config file now that we have it.
+    _setup_logging(config.log_level)
+    log = logging.getLogger("main")
+
     # Build the shared pipeline (compositor + kmssink)
     try:
-        vp = ViewportPipeline(config, connector_id=args.connector_id)
+        vp = ViewportPipeline(config, connector_id=config.display.connector_id)
     except RuntimeError as exc:
         log.error("Pipeline setup failed: %s", exc)
         return 1
@@ -130,9 +124,10 @@ def main() -> int:
     signal.signal(signal.SIGTERM, _shutdown)
 
     log.info(
-        "viewport running — %dx%d, %d cell(s). Press Ctrl-C to stop.",
+        "viewport running — %dx%d @ %d fps, %d cell(s). Press Ctrl-C to stop.",
         config.display.width,
         config.display.height,
+        config.display.framerate,
         sum(1 for c in config.cells if c is not None),
     )
 

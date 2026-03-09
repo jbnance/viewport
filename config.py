@@ -28,6 +28,9 @@ class DisplayConfig:
     # switches the compositor to a fixed-interval timer that composites
     # whatever frame each pad currently has every 1/framerate seconds.
     framerate: int = 15
+    # DRM connector ID for kmssink.  None = auto-detect (works for most setups).
+    # Run `modetest -c` on the Pi to list available connector IDs.
+    connector_id: Optional[int] = None
 
     @property
     def cell_width(self) -> int:
@@ -66,6 +69,7 @@ class AppConfig:
     display: DisplayConfig
     decoder: DecoderConfig
     cells: list[CellConfig]
+    log_level: str = "INFO"   # DEBUG | INFO | WARNING | ERROR
 
     def __post_init__(self) -> None:
         if len(self.cells) > CELL_COUNT:
@@ -76,6 +80,13 @@ class AppConfig:
         # Blank cells show black; they have no streams and no rotation.
         while len(self.cells) < CELL_COUNT:
             self.cells.append(None)  # type: ignore[arg-type]
+
+        valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR"}
+        self.log_level = self.log_level.upper()
+        if self.log_level not in valid_levels:
+            raise ValueError(
+                f"log_level must be one of {sorted(valid_levels)}, got '{self.log_level}'"
+            )
 
 
 _BLANK_CELL: Optional[CellConfig] = None  # sentinel for empty cells
@@ -95,10 +106,12 @@ def load_config(path: str) -> AppConfig:
 
     # Display
     disp_raw = raw.get("display", {})
+    raw_connector = disp_raw.get("connector_id", None)
     display = DisplayConfig(
         width=int(disp_raw.get("width", 1920)),
         height=int(disp_raw.get("height", 1080)),
         framerate=int(disp_raw.get("framerate", 15)),
+        connector_id=int(raw_connector) if raw_connector is not None else None,
     )
 
     # Decoder
@@ -125,7 +138,12 @@ def load_config(path: str) -> AppConfig:
         except (KeyError, ValueError) as exc:
             raise ValueError(f"Invalid cell config at index {i}: {exc}") from exc
 
-    cfg = AppConfig(display=display, decoder=decoder, cells=cells)
+    cfg = AppConfig(
+        display=display,
+        decoder=decoder,
+        cells=cells,
+        log_level=str(raw.get("log_level", "INFO")),
+    )
     log.info(
         "Loaded config: %dx%d @ %d fps display, %d cell(s) configured",
         display.width,

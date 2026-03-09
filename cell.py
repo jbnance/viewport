@@ -37,12 +37,21 @@ to drift further and further behind real-time.  The RTCP fixes applied earlier
 address the original cause of 30–60 s stalls, making leaky=2 safe to use again.
 
 Stream rotation runs directly on the GLib main loop thread (the GLib timeout
-callback), so teardown and reconnect are safe — no pad probes are used.
+callback), so teardown and reconnect are safe.
+
+Single-URL cells (no rotation) use a watchdog timer to detect stalled streams
+and reconnect automatically.  A buffer pad probe on out_queue.src updates
+_last_frame_time each time a decoded frame leaves the branch; a GLib timer
+fires every _WATCH_SECS seconds and reconnects if no frame has arrived for
+_STALE_SECS seconds (including the case where the stream never produced its
+first frame).  Both the watchdog callback and the pad probe write/read a
+single float under the Python GIL, so no explicit lock is needed.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 import gi
@@ -58,6 +67,10 @@ log = logging.getLogger(__name__)
 # all rotation cycles gets a unique name.  Using id(url) was unreliable because
 # Python reuses object ids, causing "element already exists" warnings.
 _branch_seq: int = 0
+
+# Watchdog parameters for single-URL cells.
+_STALE_SECS = 30   # seconds without a frame before reconnecting
+_WATCH_SECS = 10   # watchdog polling interval (seconds)
 
 
 def _next_suffix(cell_idx: int) -> str:
@@ -90,9 +103,16 @@ class Cell:
         self._current_idx: int = 0
         self._branch: list[Gst.Element] = []
         self._rotation_source_id: Optional[int] = None
+        self._reconnect_source_id: Optional[int] = None
         # fakesink elements created for non-video RTP pads (audio, data, …).
         # Tracked separately so _teardown_branch can clean them up.
         self._aux_elements: list[Gst.Element] = []
+
+        # Watchdog timestamps (monotonic).  Written by the pad probe on the
+        # GStreamer streaming thread; read by the watchdog on the GLib main
+        # loop thread.  A single float assignment is atomic under the GIL.
+        self._last_frame_time: float = 0.0    # 0.0 = no frame received yet
+        self._stream_start_time: float = 0.0  # set when _connect_stream runs
 
     # ------------------------------------------------------------------
     # Public API
@@ -120,12 +140,25 @@ class Cell:
                 self.cell_cfg.rotation_interval,
                 len(self.cell_cfg.streams),
             )
+        elif len(self.cell_cfg.streams) == 1:
+            # Single-URL cells use a watchdog to detect stalls and reconnect.
+            self._reconnect_source_id = GLib.timeout_add_seconds(
+                _WATCH_SECS, self._on_reconnect_watchdog
+            )
+            log.debug(
+                "Cell %d: reconnect watchdog active (%ds stale threshold)",
+                self.index,
+                _STALE_SECS,
+            )
 
     def stop(self) -> None:
         """Tear down the active branch cleanly."""
         if self._rotation_source_id is not None:
             GLib.source_remove(self._rotation_source_id)
             self._rotation_source_id = None
+        if self._reconnect_source_id is not None:
+            GLib.source_remove(self._reconnect_source_id)
+            self._reconnect_source_id = None
         self._teardown_branch()
 
     # ------------------------------------------------------------------
@@ -150,6 +183,12 @@ class Cell:
             el.sync_state_with_parent()
 
         self._branch = branch
+
+        # Record when this connection attempt started so the watchdog can
+        # measure the time since the last frame (or since we first connected
+        # if no frame has arrived yet).
+        self._stream_start_time = time.monotonic()
+        self._last_frame_time = 0.0
 
     def _teardown_branch(self) -> None:
         """Unlink, stop, and remove the current branch elements from the pipeline."""
@@ -187,6 +226,11 @@ class Cell:
             self.pipeline.remove(el)
         if aux:
             log.debug("Cell %d: removed %d auxiliary element(s)", self.index, len(aux))
+
+        # Reset watchdog timestamps so the next _connect_stream call starts
+        # fresh; the probe will repopulate _last_frame_time once frames flow.
+        self._last_frame_time = 0.0
+        self._stream_start_time = 0.0
 
     # ------------------------------------------------------------------
     # Branch construction
@@ -247,6 +291,13 @@ class Cell:
         # depayloader; rtspsrc's internal jitter buffer handles packet ordering.
         src.connect("pad-added", self._on_pad_added, depay)
         src.connect("no-more-pads", self._on_no_more_pads)
+
+        # Watchdog probe: update _last_frame_time on every buffer that leaves
+        # this branch.  Runs on a GStreamer streaming thread; a single float
+        # write is atomic under the Python GIL so no lock is needed.
+        out_src_pad = out_queue.get_static_pad("src")
+        if out_src_pad is not None:
+            out_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_frame_probe)
 
         return branch
 
@@ -411,6 +462,58 @@ class Cell:
 
     def _on_no_more_pads(self, src: Gst.Element) -> None:
         log.debug("Cell %d: rtspsrc no-more-pads", self.index)
+
+    def _on_frame_probe(
+        self, pad: Gst.Pad, info: Gst.PadProbeInfo
+    ) -> Gst.PadProbeReturn:
+        """Streaming-thread probe: stamp the time of each decoded frame.
+
+        Called on a GStreamer streaming thread.  Writes a single float, which
+        is atomic under the Python GIL — no explicit lock needed.
+        """
+        self._last_frame_time = time.monotonic()
+        return Gst.PadProbeReturn.OK
+
+    def _on_reconnect_watchdog(self) -> bool:
+        """GLib timer: reconnect the stream if no frames have arrived recently.
+
+        Runs on the GLib main loop thread — safe for pipeline topology changes.
+        Returns True to keep the timer running, False to cancel it.
+        """
+        if self.cell_cfg is None or len(self.cell_cfg.streams) != 1:
+            return False  # mis-configured; cancel timer
+
+        now = time.monotonic()
+        if self._last_frame_time > 0.0:
+            # At least one frame has been received; measure staleness from it.
+            elapsed = now - self._last_frame_time
+        elif self._stream_start_time > 0.0:
+            # No frame yet; measure from when we first connected.
+            elapsed = now - self._stream_start_time
+        else:
+            # _connect_stream hasn't run yet (shouldn't normally happen).
+            return True
+
+        if elapsed < _STALE_SECS:
+            return True  # stream is healthy; keep timer running
+
+        url = self.cell_cfg.streams[0]
+        log.warning(
+            "Cell %d: no frames for %.0f s — reconnecting to %s",
+            self.index,
+            elapsed,
+            url,
+        )
+        self._teardown_branch()
+        try:
+            self._connect_stream(url)
+        except Exception as exc:
+            log.error("Cell %d: reconnect failed: %s", self.index, exc)
+            # _stream_start_time was reset by _teardown_branch and will be set
+            # again by _connect_stream; next watchdog tick will try again after
+            # another _STALE_SECS of silence.
+
+        return True  # keep timer running
 
     # ------------------------------------------------------------------
     # Rotation
