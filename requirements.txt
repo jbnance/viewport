@@ -1,0 +1,15 @@
+# viewport Python dependencies
+#
+# On Raspberry Pi OS / Debian, install these via apt rather than pip:
+#
+#   sudo apt-get install python3-gi python3-gst-1.0 gir1.2-gstreamer-1.0 python3-yaml
+#
+# pip install is possible but requires GStreamer development headers and
+# build tools (libgstreamer1.0-dev, libgirepository1.0-dev, etc.) to compile
+# PyGObject from source.  The apt packages are strongly preferred on the Pi.
+
+# GObject/GStreamer Python bindings (python3-gi / gir1.2-gstreamer-1.0 on Debian)
+PyGObject>=3.36.0
+
+# YAML configuration file parsing (python3-yaml on Debian)
+PyYAML>=5.4

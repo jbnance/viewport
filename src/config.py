@@ -47,6 +47,18 @@ class DecoderConfig:
 
 
 @dataclass
+class ResolvedDecoders:
+    """Decoder element names chosen once at startup by probing the GStreamer registry.
+
+    Stored as strings (element factory names) so that each Cell branch can call
+    Gst.ElementFactory.make(name) without re-probing hardware availability on
+    every stream connection or reconnection.
+    """
+    h264: str   # e.g. "v4l2slh264dec" or "avdec_h264"
+    h265: str   # e.g. "v4l2slh265dec" or "avdec_h265"
+
+
+@dataclass
 class CellConfig:
     streams: list[str]
     rotation_interval: int = 0   # seconds; 0 = no rotation

@@ -48,20 +48,22 @@ sudo usermod -aG video $USER
 # Log out and back in, or run: newgrp video
 ```
 
-### 3. Copy the application files
+### 3. Run the install script
 
 ```bash
-sudo mkdir -p /opt/viewport
-sudo cp main.py config.py pipeline.py cell.py /opt/viewport/
-sudo chmod +x /opt/viewport/main.py
+sudo bash install.sh
 ```
 
-### 4. Create your configuration
+The script installs system packages, adds your user to the `video` group,
+copies the application files to `/opt/viewport`, places an example config at
+`/etc/viewport/config.yaml`, installs the systemd unit, and enables the service.
+
+Run `bash install.sh --help` for available options (custom user, paths, etc.).
+
+### 4. Edit your configuration
 
 ```bash
-sudo mkdir -p /etc/viewport
-sudo cp config.example.yaml /etc/viewport/config.yaml
-sudo nano /etc/viewport/config.yaml   # edit with your RTSP URLs
+sudo nano /etc/viewport/config.yaml   # add your RTSP stream URLs
 ```
 
 ## Configuration
@@ -106,7 +108,7 @@ cells:
 
 ```yaml
 decoder:
-  prefer_hardware: true   # use v4l2h264dec/v4l2h265dec when available
+  prefer_hardware: true   # use v4l2slh264dec/v4l2slh265dec when available
 ```
 
 ## Running
@@ -114,14 +116,12 @@ decoder:
 ### Direct (foreground)
 
 ```bash
-python3 /opt/viewport/main.py --config /etc/viewport/config.yaml
+python3 /opt/viewport/main.py /etc/viewport/config.yaml
 ```
 
 ### With debug logging
 
-```bash
-python3 /opt/viewport/main.py --config /etc/viewport/config.yaml --log-level DEBUG
-```
+Set `log_level: DEBUG` in your config file, then run as above.
 
 ### Specifying a DRM connector
 
@@ -130,15 +130,19 @@ If you have multiple monitors or the auto-detected connector is wrong:
 ```bash
 # List available connectors
 modetest -c
+```
 
-# Use a specific connector
-python3 /opt/viewport/main.py --config /etc/viewport/config.yaml --connector-id 42
+Then set `connector_id` in your config file under the `display:` section:
+
+```yaml
+display:
+  connector_id: 42   # replace with the ID shown by modetest -c
 ```
 
 ### As a systemd service (autostart at boot)
 
 ```bash
-sudo cp viewport.service /etc/systemd/system/
+sudo cp deploy/viewport.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable viewport
 sudo systemctl start viewport
@@ -160,31 +164,32 @@ ls /dev/dri/
 ### Test a single RTSP stream with GStreamer
 
 ```bash
-# Software decoder (works without hardware)
+# Software decoder (works without hardware acceleration)
 gst-launch-1.0 rtspsrc location=rtsp://YOUR_URL ! \
     rtph264depay ! h264parse ! avdec_h264 ! videoconvert ! kmssink
 
-# Hardware decoder
+# Hardware decoder (stateless rpivid, Raspberry Pi 4+)
 gst-launch-1.0 rtspsrc location=rtsp://YOUR_URL ! \
-    rtph264depay ! h264parse ! v4l2h264dec ! videoconvert ! kmssink
+    rtph264depay ! h264parse ! v4l2slh264dec ! videoconvert ! kmssink
 ```
 
 ### Check available GStreamer plugins
 
 ```bash
-gst-inspect-1.0 kmssink       # DRM/KMS output
-gst-inspect-1.0 v4l2h264dec   # hardware H.264 decoder
-gst-inspect-1.0 v4l2h265dec   # hardware H.265 decoder
-gst-inspect-1.0 compositor    # multi-stream compositor
+gst-inspect-1.0 kmssink         # DRM/KMS output
+gst-inspect-1.0 v4l2slh264dec   # hardware H.264 decoder (stateless rpivid)
+gst-inspect-1.0 v4l2slh265dec   # hardware H.265 decoder (stateless rpivid)
+gst-inspect-1.0 compositor      # multi-stream compositor
 ```
 
 ### Hardware decoder not found
 
-If `v4l2h264dec` is unavailable, set `prefer_hardware: false` in your config.
-The application will fall back to software decoding (`avdec_h264`).
+viewport uses the stateless V4L2 decoder (`v4l2slh264dec` / `v4l2slh265dec`),
+which requires the **rpivid** kernel driver.  If it is unavailable, the
+application automatically falls back to software decoding (`avdec_h264`); you
+can also opt out explicitly with `prefer_hardware: false` in your config.
 
-On Raspberry Pi OS, hardware decoders are provided by the `rpicam` or V4L2
-kernel modules.  Ensure your firmware is up to date:
+Ensure your firmware is up to date:
 
 ```bash
 sudo rpi-update
@@ -194,41 +199,42 @@ sudo rpi-update
 
 - Verify the RTSP URL is reachable: `ffprobe rtsp://YOUR_URL`
 - Ensure the Pi can reach the camera network
-- Check logs with `--log-level DEBUG` or `GST_DEBUG=rtspsrc:5`
+- Set `log_level: DEBUG` in your config, or run with `GST_DEBUG=rtspsrc:5`
 
 ## Architecture
 
 ```
-main.py         — entry point, argument parsing, GLib main loop
-config.py       — YAML config loading and dataclasses
-pipeline.py     — shared GStreamer pipeline (compositor + kmssink)
-cell.py         — per-cell RTSP branch management and stream rotation
+src/main.py      — entry point, argument parsing, GLib main loop
+src/config.py    — YAML config loading and dataclasses
+src/pipeline.py  — shared GStreamer pipeline (compositor + kmssink)
+src/cell.py      — per-cell RTSP branch management and stream rotation
 ```
 
 Each cell owns an independent GStreamer element branch:
 
 ```
-rtspsrc ─(pad-added)─► queue ─► rtph264depay ─► h264parse
-                                                     │
-                                              v4l2h264dec (hw)
-                                              or avdec_h264 (sw)
-                                                     │
-                                              videoconvert
-                                                     │
-                                               videoscale
-                                                     │
-                                        capsfilter (cell WxH)
-                                                     │
-                                                  queue
-                                                     │
-                                         compositor sink pad
-                                                     │
-                                               kmssink (DRM/KMS)
+rtspsrc ─(pad-added)─► rtph264depay ─► h264parse
+                                             │
+                                    v4l2slh264dec (hw, stateless)
+                                    or avdec_h264 (sw fallback)
+                                             │
+                                       videoconvert
+                                             │
+                                     queue (leaky, drop-oldest)
+                                             │
+                                   compositor sink pad
+                                             │
+                                      capsfilter (framerate)
+                                             │
+                                       kmssink (DRM/KMS)
 ```
 
-Stream rotation uses GStreamer pad probes to block the compositor input pad
-while the old branch is torn down and a new branch is connected, minimising
-visual glitches during the transition.
+The compositor scales each input to its cell dimensions via pad properties,
+so no separate `videoscale` or per-cell `capsfilter` is needed.
+
+Stream rotation and reconnection (for stalled single-URL cells) both run on
+the GLib main loop thread, calling a teardown + reconnect sequence without
+any GStreamer pad probes.
 
 ## License
 

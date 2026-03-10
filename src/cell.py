@@ -59,7 +59,7 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst, GLib  # noqa: E402
 
-from config import CellConfig, DecoderConfig
+from config import CellConfig, DecoderConfig, ResolvedDecoders
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +79,36 @@ def _next_suffix(cell_idx: int) -> str:
     return f"cell{cell_idx}_{_branch_seq}"
 
 
+def detect_decoders(dec_cfg: DecoderConfig) -> ResolvedDecoders:
+    """Probe the GStreamer registry to pick the best available decoder for each codec.
+
+    Must be called after Gst.init().  Uses Gst.ElementFactory.find() to query
+    the registry without constructing any elements, so there is no pipeline side
+    effect.  Call once at startup; pass the returned ResolvedDecoders to every
+    Cell so that each branch build simply does ElementFactory.make(known_name)
+    without repeating the hardware-availability check.
+    """
+    def _pick(hw_name: Optional[str], sw_name: str, label: str) -> str:
+        if hw_name is not None and Gst.ElementFactory.find(hw_name) is not None:
+            log.info("Decoder (%s): hardware '%s' available", label, hw_name)
+            return hw_name
+        if hw_name is not None:
+            log.warning(
+                "Decoder (%s): hardware '%s' not available, falling back to software '%s'",
+                label, hw_name, sw_name,
+            )
+        else:
+            log.info("Decoder (%s): using software '%s'", label, sw_name)
+        return sw_name
+
+    h264_hw = "v4l2slh264dec" if dec_cfg.prefer_hardware else None
+    h265_hw = "v4l2slh265dec" if dec_cfg.prefer_hardware else None
+    return ResolvedDecoders(
+        h264=_pick(h264_hw, "avdec_h264", "H.264"),
+        h265=_pick(h265_hw, "avdec_h265", "H.265"),
+    )
+
+
 class Cell:
     """Manages one grid cell: one active RTSP branch + optional rotation."""
 
@@ -86,7 +116,7 @@ class Cell:
         self,
         index: int,
         cell_cfg: Optional[CellConfig],
-        dec_cfg: DecoderConfig,
+        decoders: ResolvedDecoders,
         pipeline: Gst.Pipeline,
         compositor_pad: Gst.Pad,
         cell_width: int,
@@ -94,7 +124,7 @@ class Cell:
     ) -> None:
         self.index = index
         self.cell_cfg = cell_cfg
-        self.dec_cfg = dec_cfg
+        self._decoders = decoders
         self.pipeline = pipeline
         self.compositor_pad = compositor_pad
         self.cell_width = cell_width
@@ -331,49 +361,33 @@ class Cell:
     # ------------------------------------------------------------------
 
     def _make_decoder(self, codec: str) -> Gst.Element:
-        prefer_hw = self.dec_cfg.prefer_hardware
+        """Create a decoder element using the name resolved once at startup.
 
-        # v4l2h264dec (GStreamer's stateful V4L2 decoder, bcm2835-codec driver)
-        # is intentionally NOT used: on Debian Trixie / GStreamer 1.24 it emits
-        # "N initial frames were not dequeued: bug in decoder" and stalls
-        # permanently after the first frame.  The driver's CAPTURE queue does not
-        # properly resume after the flush that rtspsrc performs when its jitter
-        # buffer synchronises on startup.
-        #
-        # v4l2slh264dec uses the *stateless* V4L2 API (rpivid driver) which
-        # avoids the flush-resume bug.  It ships in gstreamer1.0-plugins-bad and
-        # is the preferred hardware path on Debian Trixie.  If unavailable,
-        # avdec_h264 (FFmpeg software decode) is used as a fully reliable
-        # fallback.
-        if codec == "h265":
-            hw_candidates = ("v4l2slh265dec",) if prefer_hw else ()
-            sw_name = "avdec_h265"
-        else:
-            hw_candidates = ("v4l2slh264dec",) if prefer_hw else ()
-            sw_name = "avdec_h264"
+        Hardware vs. software selection was already decided by detect_decoders()
+        before the pipeline started.  This method simply instantiates the
+        pre-chosen element by name, avoiding repeated registry probes on every
+        stream connection, rotation, or reconnect.
 
-        for hw_name in hw_candidates:
-            el = Gst.ElementFactory.make(hw_name)
-            if el is not None:
-                log.debug("Cell %d: using hardware decoder %s", self.index, hw_name)
-                return el
-            log.warning(
-                "Cell %d: hardware decoder '%s' not available, falling back to software",
-                self.index,
-                hw_name,
-            )
-
-        el = Gst.ElementFactory.make(sw_name)
+        Note on v4l2h264dec: the stateful bcm2835-codec decoder is intentionally
+        excluded.  On Debian Trixie / GStreamer 1.24 it stalls permanently after
+        the first frame ("N initial frames were not dequeued: bug in decoder").
+        v4l2slh264dec (stateless rpivid) avoids the flush-resume bug and is the
+        preferred hardware path; avdec_h264 is the software fallback.
+        """
+        name = self._decoders.h265 if codec == "h265" else self._decoders.h264
+        el = Gst.ElementFactory.make(name)
         if el is None:
             raise RuntimeError(
-                f"Cell {self.index}: no usable decoder for codec '{codec}'"
+                f"Cell {self.index}: failed to create decoder '{name}' "
+                f"(element was available at startup but is now missing)"
             )
-        # Cap per-stream thread count.  avdec_h264's default (max-threads=0,
-        # auto) may claim all 4 cores per instance; 6 concurrent decoders ×
-        # 2 threads = 12 threads on 4 cores — far better than the uncapped
-        # default while still allowing slice-level parallelism within each stream.
-        el.set_property("max-threads", 2)
-        log.debug("Cell %d: using software decoder %s", self.index, sw_name)
+        # Cap thread count for software decoders (avdec_*).
+        # avdec_h264's auto mode may claim all 4 cores per instance;
+        # 6 streams × 2 threads = 12 threads on 4 cores provides good
+        # slice-level parallelism without starving other work.
+        if name.startswith("avdec_"):
+            el.set_property("max-threads", 2)
+        log.debug("Cell %d: created decoder %s", self.index, name)
         return el
 
     @staticmethod

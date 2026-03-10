@@ -27,7 +27,7 @@ from gi.repository import Gst, GLib  # noqa: E402
 
 from config import load_config
 from pipeline import ViewportPipeline
-from cell import Cell
+from cell import Cell, detect_decoders
 
 
 def _setup_logging(level_name: str) -> None:
@@ -76,6 +76,11 @@ def main() -> int:
     _setup_logging(config.log_level)
     log = logging.getLogger("main")
 
+    # Probe the GStreamer registry once to pick hardware vs. software decoders.
+    # This runs a single registry query per codec instead of repeating it on
+    # every stream connection, rotation, and reconnect across all 6 cells.
+    decoders = detect_decoders(config.decoder)
+
     # Build the shared pipeline (compositor + kmssink)
     try:
         vp = ViewportPipeline(config, connector_id=config.display.connector_id)
@@ -89,7 +94,7 @@ def main() -> int:
         cell = Cell(
             index=i,
             cell_cfg=cell_cfg,
-            dec_cfg=config.decoder,
+            decoders=decoders,
             pipeline=vp.pipeline,
             compositor_pad=vp.get_compositor_pad(i),
             cell_width=config.display.cell_width,
