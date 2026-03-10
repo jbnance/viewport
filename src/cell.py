@@ -198,7 +198,8 @@ class Cell:
     def _connect_stream(self, url: str) -> None:
         """Build a new branch for *url*, add it to the pipeline, and sync state."""
         codec = self.cell_cfg.codec if self.cell_cfg else "h264"
-        log.info("Cell %d: connecting to %s (%s)", self.index, url, codec)
+        log.info("Cell %d: connecting to %s (%s)", self.index,
+                 self._stream_display(url, self._current_idx), codec)
 
         branch = self._build_branch(url, codec)
         for el in branch:
@@ -390,6 +391,14 @@ class Cell:
         log.debug("Cell %d: created decoder %s", self.index, name)
         return el
 
+    def _stream_display(self, url: str, idx: int) -> str:
+        """Return 'label (url)' when the stream has a name, or just 'url' for raw URLs."""
+        if self.cell_cfg:
+            labels = self.cell_cfg.stream_labels
+            if labels and idx < len(labels) and labels[idx] != url:
+                return f"{labels[idx]} ({url})"
+        return url
+
     @staticmethod
     def _make(element_type: str, name: str) -> Gst.Element:
         el = Gst.ElementFactory.make(element_type, name)
@@ -516,7 +525,7 @@ class Cell:
             "Cell %d: no frames for %.0f s — reconnecting to %s",
             self.index,
             elapsed,
-            url,
+            self._stream_display(url, 0),
         )
         self._teardown_branch()
         try:
@@ -545,7 +554,8 @@ class Cell:
         next_idx = (self._current_idx + 1) % len(self.cell_cfg.streams)
         next_url = self.cell_cfg.streams[next_idx]
         log.info(
-            "Cell %d: rotating → stream %d (%s)", self.index, next_idx, next_url
+            "Cell %d: rotating → stream %d (%s)", self.index, next_idx,
+            self._stream_display(next_url, next_idx)
         )
         self._current_idx = next_idx
 

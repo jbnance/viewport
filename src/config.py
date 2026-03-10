@@ -60,9 +60,13 @@ class ResolvedDecoders:
 
 @dataclass
 class CellConfig:
-    streams: list[str]
+    streams: list[str]           # resolved RTSP URLs
     rotation_interval: int = 0   # seconds; 0 = no rotation
     codec: str = "h264"          # "h264" or "h265"
+    # Human-readable label for each resolved URL, parallel to streams[].
+    # label[i] == streams[i] means the stream has no name (raw URL).
+    # Used only for log messages; empty list is valid (falls back to URL).
+    stream_labels: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if not self.streams:
@@ -132,7 +136,67 @@ def load_config(path: str) -> AppConfig:
         prefer_hardware=bool(dec_raw.get("prefer_hardware", True)),
     )
 
+    # ------------------------------------------------------------------
+    # Named stream registry: optional top-level 'streams:' mapping (name → URL)
+    # ------------------------------------------------------------------
+    stream_reg: dict[str, str] = {}
+    streams_section = raw.get("streams", {})
+    if streams_section:
+        if not isinstance(streams_section, dict):
+            raise ValueError(
+                "Top-level 'streams:' must be a YAML mapping (name: url). "
+                "To list streams in a cell use the 'streams:' key inside a cell entry."
+            )
+        for name, url in streams_section.items():
+            if not isinstance(url, str) or "://" not in url:
+                raise ValueError(
+                    f"Stream '{name}': value must be a full URL containing '://' "
+                    f"(stream names cannot point to other names)"
+                )
+            stream_reg[name] = url
+
+    # Reverse-lookup: URL → name (for recovering stream names from group entries)
+    def _name_for(url: str) -> Optional[str]:
+        return next((k for k, v in stream_reg.items() if v == url), None)
+
+    # ------------------------------------------------------------------
+    # Group registry: optional top-level 'groups:' mapping (name → [names/URLs])
+    # Groups are resolved eagerly to URL lists; they cannot reference other groups.
+    # ------------------------------------------------------------------
+    group_reg: dict[str, list[str]] = {}
+    groups_section = raw.get("groups", {})
+    if groups_section:
+        if not isinstance(groups_section, dict):
+            raise ValueError(
+                "Top-level 'groups:' must be a YAML mapping (name: [stream, ...])"
+            )
+        for gname, members in groups_section.items():
+            if gname in stream_reg:
+                raise ValueError(
+                    f"Group '{gname}' conflicts with a stream of the same name. "
+                    f"Stream names and group names must be unique."
+                )
+            if not isinstance(members, list) or not members:
+                raise ValueError(
+                    f"Group '{gname}': value must be a non-empty list of stream names or URLs"
+                )
+            resolved_members: list[str] = []
+            for j, item in enumerate(members):
+                item_str = str(item)
+                if "://" in item_str:
+                    resolved_members.append(item_str)
+                elif item_str in stream_reg:
+                    resolved_members.append(stream_reg[item_str])
+                else:
+                    raise ValueError(
+                        f"Group '{gname}', item {j}: unknown stream name '{item_str}' "
+                        f"(groups cannot reference other groups)"
+                    )
+            group_reg[gname] = resolved_members
+
+    # ------------------------------------------------------------------
     # Cells
+    # ------------------------------------------------------------------
     cells_raw = raw.get("cells", [])
     cells: list[CellConfig] = []
     for i, c in enumerate(cells_raw):
@@ -140,9 +204,41 @@ def load_config(path: str) -> AppConfig:
             cells.append(None)  # type: ignore[arg-type]
             continue
         try:
+            if "streams" not in c:
+                raise ValueError("must specify 'streams:'")
+            raw_list = c["streams"]
+            if not isinstance(raw_list, list) or not raw_list:
+                raise ValueError("'streams:' must be a non-empty list")
+
+            resolved_streams: list[str] = []
+            resolved_labels: list[str] = []
+            for j, item in enumerate(raw_list):
+                item_str = str(item)
+                if "://" in item_str:
+                    # Raw URL — label is the URL itself
+                    resolved_streams.append(item_str)
+                    resolved_labels.append(item_str)
+                elif item_str in stream_reg:
+                    # Named stream
+                    resolved_streams.append(stream_reg[item_str])
+                    resolved_labels.append(item_str)
+                elif item_str in group_reg:
+                    # Group — flatten all member URLs inline
+                    for k, url in enumerate(group_reg[item_str]):
+                        resolved_streams.append(url)
+                        sname = _name_for(url) or f"{item_str}[{k}]"
+                        resolved_labels.append(f"{sname} [{item_str}]")
+                else:
+                    raise ValueError(
+                        f"streams[{j}]: unknown stream name or group '{item_str}' "
+                        f"(not a URL, not defined in top-level 'streams:', "
+                        f"and not defined in top-level 'groups:')"
+                    )
+
             cells.append(
                 CellConfig(
-                    streams=c["streams"],
+                    streams=resolved_streams,
+                    stream_labels=resolved_labels,
                     rotation_interval=int(c.get("rotation_interval", 0)),
                     codec=str(c.get("codec", "h264")),
                 )
