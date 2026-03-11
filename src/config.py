@@ -32,11 +32,20 @@ class DisplayConfig:
     # DRM connector ID for kmssink.  None = auto-detect (works for most setups).
     # Run `modetest -c` on the Pi to list available connector IDs.
     connector_id: Optional[int] = None
+    # Shadow-branch preload timeout.  When a rotating cell preloads the next
+    # stream in the background, it waits up to this many seconds for the first
+    # decoded frame before giving up and falling back to a direct swap.
+    preload_timeout: int = 10
 
     def __post_init__(self) -> None:
         if self.rows < 1 or self.cols < 1:
             raise ValueError(
                 f"display rows and cols must each be >= 1, got {self.rows}×{self.cols}"
+            )
+        if self.preload_timeout < 1:
+            raise ValueError(
+                f"display.preload_timeout must be >= 1 second "
+                f"(got {self.preload_timeout!r})"
             )
 
     @property
@@ -219,6 +228,7 @@ def load_config(path: str) -> AppConfig:
         rows=int(disp_raw.get("rows", 3)),
         cols=int(disp_raw.get("cols", 2)),
         connector_id=int(raw_connector) if raw_connector is not None else None,
+        preload_timeout=int(disp_raw.get("preload_timeout", 10)),
     )
 
     # Decoder

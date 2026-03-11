@@ -36,8 +36,14 @@ to drift further and further behind real-time.  The RTCP fixes applied earlier
 (max-rtcp-rtp-time-diff=-1, do-rtcp enabled by default, config-interval=-1)
 address the original cause of 30–60 s stalls, making leaky=2 safe to use again.
 
-Stream rotation runs directly on the GLib main loop thread (the GLib timeout
-callback), so teardown and reconnect are safe.
+Stream rotation uses a shadow-branch preloading strategy to eliminate visible
+gaps during stream changes.  When the rotation timer fires, a "shadow" branch
+for the next stream is built and linked to a temporary fakesink.  While the
+current stream continues displaying normally, the shadow branch connects,
+negotiates, and decodes its first keyframe.  Once a decoded frame arrives, the
+branches are hot-swapped on the GLib main loop: the shadow branch is re-linked
+to the compositor and the old branch is torn down.  The current stream is
+visible right up to the moment the new stream is ready, eliminating the gap.
 
 Single-URL cells (no rotation) use a watchdog timer to detect stalled streams
 and reconnect automatically.  A buffer pad probe on out_queue.src updates
@@ -119,6 +125,7 @@ class Cell:
         decoders: ResolvedDecoders,
         pipeline: Gst.Pipeline,
         compositor_pad: Gst.Pad,
+        preload_timeout: int = 10,
     ) -> None:
         self.index = index
         self.cell_cfg = cell_cfg
@@ -139,6 +146,21 @@ class Cell:
         # loop thread.  A single float assignment is atomic under the GIL.
         self._last_frame_time: float = 0.0    # 0.0 = no frame received yet
         self._stream_start_time: float = 0.0  # set when _connect_stream runs
+
+        # Shadow branch state — used during preload-based rotation.
+        # _shadow_branch holds the not-yet-active branch being preloaded;
+        # _shadow_fakesink is the temporary sink that discards its output;
+        # _shadow_aux_elements holds any non-video fakesinks for the shadow rtspsrc.
+        # _preloading is True from _start_preload() until the first shadow frame
+        # arrives or the timeout fires; it gates the idle_add in the probe so
+        # the swap is only scheduled once.
+        self._shadow_branch: list[Gst.Element] = []
+        self._shadow_fakesink: Optional[Gst.Element] = None
+        self._shadow_aux_elements: list[Gst.Element] = []
+        self._shadow_next_idx: int = 0
+        self._preloading: bool = False
+        self._preload_timeout_id: Optional[int] = None
+        self._preload_timeout: int = preload_timeout
 
     # ------------------------------------------------------------------
     # Public API
@@ -181,6 +203,9 @@ class Cell:
         if self._reconnect_source_id is not None:
             GLib.source_remove(self._reconnect_source_id)
             self._reconnect_source_id = None
+        # Abort any in-progress preload before tearing down the active branch.
+        if self._preloading or self._shadow_branch:
+            self._abort_preload()
         self._teardown_branch()
 
     # ------------------------------------------------------------------
@@ -259,8 +284,15 @@ class Cell:
     # Branch construction
     # ------------------------------------------------------------------
 
-    def _build_branch(self, url: str, codec: str) -> list[Gst.Element]:
-        """Create all GStreamer elements for one RTSP stream branch."""
+    def _build_branch(
+        self, url: str, codec: str, install_watchdog: bool = True
+    ) -> list[Gst.Element]:
+        """Create all GStreamer elements for one RTSP stream branch.
+
+        When *install_watchdog* is False, no BUFFER probe is installed on
+        out_queue.src.  Pass False for shadow (preload) branches; the probe is
+        added by _complete_swap() once the branch is promoted to active.
+        """
         suffix = _next_suffix(self.index)
 
         src = self._make("rtspsrc", f"src_{suffix}")
@@ -316,19 +348,31 @@ class Cell:
         src.connect("no-more-pads", self._on_no_more_pads)
 
         # Watchdog probe: update _last_frame_time on every buffer that leaves
-        # this branch.  Runs on a GStreamer streaming thread; a single float
-        # write is atomic under the Python GIL so no lock is needed.
-        out_src_pad = out_queue.get_static_pad("src")
-        if out_src_pad is not None:
-            out_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_frame_probe)
+        # this branch.  Skipped for shadow branches (install_watchdog=False);
+        # _complete_swap() installs it after promotion.
+        if install_watchdog:
+            out_src_pad = out_queue.get_static_pad("src")
+            if out_src_pad is not None:
+                out_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_frame_probe)
 
         return branch
 
-    def _link_static_branch(self, branch: list[Gst.Element]) -> None:
-        """Link the static part of the branch (depay → … → out_queue → compositor).
+    def _link_static_branch(
+        self,
+        branch: list[Gst.Element],
+        dst_pad: Optional[Gst.Pad] = None,
+    ) -> None:
+        """Link the static part of the branch (depay → … → out_queue → dst_pad).
 
         rtspsrc (branch[0]) links to depay (branch[1]) dynamically via pad-added.
+
+        If *dst_pad* is None, the output queue is linked to self.compositor_pad
+        (the normal case for active branches).  For shadow branches, pass the
+        sink pad of the temporary fakesink.
         """
+        if dst_pad is None:
+            dst_pad = self.compositor_pad
+
         # branch: [rtspsrc, depay, parser, decoder, videoconvert, out_queue]
         static_chain = branch[1:]  # everything after rtspsrc
         for i in range(len(static_chain) - 1):
@@ -338,15 +382,15 @@ class Cell:
                     f"{static_chain[i].get_name()} → {static_chain[i+1].get_name()}"
                 )
 
-        # Link the output queue's src pad to the compositor's pre-allocated sink pad
+        # Link the output queue's src pad to the destination pad.
         out_queue = branch[-1]
         src_pad = out_queue.get_static_pad("src")
         if src_pad is None:
             raise RuntimeError(f"Cell {self.index}: output queue has no src pad")
-        ret = src_pad.link(self.compositor_pad)
+        ret = src_pad.link(dst_pad)
         if ret != Gst.PadLinkReturn.OK:
             raise RuntimeError(
-                f"Cell {self.index}: failed to link output queue → compositor pad: {ret}"
+                f"Cell {self.index}: failed to link output queue → destination pad: {ret}"
             )
 
     # ------------------------------------------------------------------
@@ -413,6 +457,10 @@ class Cell:
         link only the video RTP pad; linking an audio pad to rtph264depay
         would fail with GST_PAD_LINK_NOFORMAT because the depayloader only
         accepts video RTP caps.
+
+        Non-video aux elements (fakesinks) are routed to _shadow_aux_elements
+        when the rtspsrc belongs to the shadow branch, and to _aux_elements
+        otherwise.  Detection uses object identity: src is _shadow_branch[0].
         """
         caps = new_pad.get_current_caps() or new_pad.query_caps(None)
         if caps is None or caps.is_empty():
@@ -448,9 +496,12 @@ class Cell:
             self.pipeline.add(fakesink)
             fakesink.sync_state_with_parent()
             sink = fakesink.get_static_pad("sink")
+            # Route to shadow aux list if this rtspsrc belongs to the shadow branch.
+            is_shadow = bool(self._shadow_branch) and src is self._shadow_branch[0]
+            aux_list = self._shadow_aux_elements if is_shadow else self._aux_elements
             try:
                 new_pad.link(sink)
-                self._aux_elements.append(fakesink)
+                aux_list.append(fakesink)
                 log.debug(
                     "Cell %d: linked non-video RTP pad to fakesink (%s…)",
                     self.index,
@@ -530,32 +581,348 @@ class Cell:
         return True  # keep timer running
 
     # ------------------------------------------------------------------
-    # Rotation
+    # Rotation — shadow-branch preloading
     # ------------------------------------------------------------------
 
     def _on_rotation_timer(self) -> bool:
-        """GLib timeout callback: rotate to the next stream.
+        """GLib timeout callback: begin preloading the next stream.
 
-        Runs on the GLib main loop thread — safe for pipeline topology changes.
-        A brief black frame during the switch (~100 ms) is acceptable.
+        Runs on the GLib main loop thread.  Instead of tearing down the current
+        stream immediately, we build a shadow branch for the next stream and
+        wait for it to produce its first decoded frame before swapping.
         """
         if len(self.cell_cfg.streams) <= 1:
             return False  # stop timer
 
+        if self._preloading:
+            # The previous preload has not yet completed (first frame still
+            # pending).  Skip this rotation tick; the next timer fire will try
+            # again.  This can happen if rotation_interval is shorter than the
+            # time a camera takes to produce its first keyframe.
+            log.debug(
+                "Cell %d: rotation timer fired while preloading; skipping",
+                self.index,
+            )
+            return True
+
         next_idx = (self._current_idx + 1) % len(self.cell_cfg.streams)
         next_url = self.cell_cfg.streams[next_idx]
-        log.info(
-            "Cell %d: rotating → stream %d (%s)", self.index, next_idx,
-            self._stream_display(next_url, next_idx)
-        )
-        self._current_idx = next_idx
+        self._shadow_next_idx = next_idx
 
-        # Tear down current branch, then connect the next one.
-        # Both operations run here on the GLib main loop — no pad probes needed.
+        log.info(
+            "Cell %d: preloading stream %d (%s)",
+            self.index, next_idx, self._stream_display(next_url, next_idx),
+        )
+
+        try:
+            self._start_preload(next_idx)
+        except Exception as exc:
+            log.error(
+                "Cell %d: preload failed to start (%s) — falling back to direct swap",
+                self.index, exc,
+            )
+            # Fall back: direct teardown + reconnect (original behaviour).
+            self._current_idx = next_idx
+            self._teardown_branch()
+            try:
+                self._connect_stream(next_url)
+            except Exception as exc2:
+                log.error("Cell %d: direct swap also failed: %s", self.index, exc2)
+
+        return True  # keep timer running
+
+    def _start_preload(self, next_idx: int) -> None:
+        """Build a shadow branch for stream *next_idx* linked to a temporary fakesink.
+
+        The shadow branch runs in the background while the current stream
+        continues to display normally.  When the first decoded frame arrives,
+        _on_shadow_frame_probe schedules _complete_swap() via GLib.idle_add.
+
+        Raises RuntimeError if any GStreamer element cannot be created or linked.
+        The caller is responsible for falling back to a direct swap on error.
+        """
+        url = self.cell_cfg.streams[next_idx]
+        codec = self.cell_cfg.codec
+
+        log.debug(
+            "Cell %d: building shadow branch for %s",
+            self.index, self._stream_display(url, next_idx),
+        )
+
+        # Build branch without the watchdog probe; the probe is installed by
+        # _complete_swap() after the branch is promoted to active.
+        shadow_branch = self._build_branch(url, codec, install_watchdog=False)
+
+        # Temporary sink that discards the shadow branch's output while it warms up.
+        shadow_fakesink = Gst.ElementFactory.make("fakesink", None)
+        if shadow_fakesink is None:
+            raise RuntimeError(f"Cell {self.index}: failed to create shadow fakesink")
+        shadow_fakesink.set_property("sync", False)   # discard immediately
+        shadow_fakesink.set_property("async", False)  # don't block pipeline preroll
+
+        # Store shadow state BEFORE adding elements to the pipeline so that
+        # _on_pad_added can detect which aux list to use when rtspsrc fires
+        # pad-added on a background thread.
+        self._shadow_branch = shadow_branch
+        self._shadow_fakesink = shadow_fakesink
+        self._shadow_aux_elements = []
+        self._preloading = True
+
+        # Add all shadow elements to the pipeline.
+        for el in shadow_branch:
+            self.pipeline.add(el)
+        self.pipeline.add(shadow_fakesink)
+
+        # Link shadow branch to the temporary fakesink.
+        fakesink_sink_pad = shadow_fakesink.get_static_pad("sink")
+        self._link_static_branch(shadow_branch, dst_pad=fakesink_sink_pad)
+
+        # Sync states — starts RTSP connection in the background.
+        for el in shadow_branch:
+            el.sync_state_with_parent()
+        shadow_fakesink.sync_state_with_parent()
+
+        # One-shot probe: fires when the first decoded frame leaves the shadow
+        # branch.  Schedules _complete_swap() on the GLib main loop.
+        shadow_out_queue = shadow_branch[-1]
+        shadow_src_pad = shadow_out_queue.get_static_pad("src")
+        if shadow_src_pad is not None:
+            shadow_src_pad.add_probe(
+                Gst.PadProbeType.BUFFER, self._on_shadow_frame_probe
+            )
+
+        # Fallback timer: if the shadow branch never produces a frame (camera
+        # unreachable, codec mismatch, etc.), abort the preload and fall back
+        # to a direct swap after _PRELOAD_TIMEOUT_SECS seconds.
+        self._preload_timeout_id = GLib.timeout_add_seconds(
+            self._preload_timeout, self._on_preload_timeout
+        )
+
+        log.debug("Cell %d: shadow branch started, waiting for first frame", self.index)
+
+    def _on_shadow_frame_probe(
+        self, pad: Gst.Pad, info: Gst.PadProbeInfo
+    ) -> Gst.PadProbeReturn:
+        """Streaming-thread probe: shadow branch has decoded its first frame.
+
+        Schedules the hot-swap on the GLib main loop via idle_add and removes
+        itself (REMOVE = one-shot).  The _preloading flag prevents a race where
+        the probe fires again before idle_add runs (shouldn't happen since we
+        return REMOVE, but the flag is a cheap safety net).
+        """
+        if self._preloading:
+            self._preloading = False
+            GLib.idle_add(self._complete_swap)
+        return Gst.PadProbeReturn.REMOVE
+
+    def _complete_swap(self) -> bool:
+        """GLib main-loop callback: hot-swap the shadow branch in as the active branch.
+
+        Called via GLib.idle_add() from _on_shadow_frame_probe() once the shadow
+        branch has produced its first decoded frame.
+
+        Sequence:
+          1. Cancel the fallback timeout.
+          2. Pause shadow elements to stop buffer flow during the re-link window.
+          3. Unlink shadow out_queue.src from shadow_fakesink.
+          4. Unlink old out_queue.src from the compositor pad.
+          5. Link shadow out_queue.src to the compositor pad.
+          6. Resume shadow elements (sync_state_with_parent → PLAYING).
+          7. Promote shadow as the active branch; update _current_idx.
+          8. Install the watchdog BUFFER probe on the newly active branch.
+          9. Tear down old branch + old aux elements + shadow_fakesink.
+
+        Returns False (GLib.SOURCE_REMOVE) — runs once only.
+        """
+        # Cancel the fallback timeout — swap is happening cleanly.
+        if self._preload_timeout_id is not None:
+            GLib.source_remove(self._preload_timeout_id)
+            self._preload_timeout_id = None
+
+        shadow_branch = self._shadow_branch
+        shadow_fakesink = self._shadow_fakesink
+        shadow_aux = self._shadow_aux_elements
+        next_idx = self._shadow_next_idx
+
+        if not shadow_branch or shadow_fakesink is None:
+            log.warning(
+                "Cell %d: _complete_swap called but shadow branch is gone", self.index
+            )
+            return False
+
+        # Clear shadow state (local vars hold the references we need).
+        self._shadow_branch = []
+        self._shadow_fakesink = None
+        self._shadow_aux_elements = []
+
+        shadow_out_queue = shadow_branch[-1]
+        shadow_src_pad = shadow_out_queue.get_static_pad("src")
+        fakesink_sink_pad = shadow_fakesink.get_static_pad("sink")
+
+        # --- Step 2: Pause shadow elements to stop buffer flow. ---
+        # This prevents GST_FLOW_NOT_LINKED errors that would occur if the
+        # streaming thread tries to push a buffer while shadow_src_pad is
+        # temporarily unpaired (between unlink and re-link below).
+        for el in shadow_branch:
+            el.set_state(Gst.State.PAUSED)
+
+        # --- Step 3: Unlink shadow from fakesink. ---
+        if shadow_src_pad is not None and shadow_src_pad.is_linked():
+            shadow_src_pad.unlink(fakesink_sink_pad)
+
+        # --- Step 4: Unlink old branch from compositor. ---
+        old_branch = self._branch
+        old_aux = self._aux_elements
+        if old_branch:
+            old_src_pad = old_branch[-1].get_static_pad("src")
+            if old_src_pad is not None and old_src_pad.is_linked():
+                old_src_pad.unlink(self.compositor_pad)
+
+        # --- Step 5: Link shadow to compositor. ---
+        if shadow_src_pad is not None:
+            ret = shadow_src_pad.link(self.compositor_pad)
+            if ret != Gst.PadLinkReturn.OK:
+                log.error(
+                    "Cell %d: shadow → compositor link failed (%s); "
+                    "re-linking old branch and aborting swap",
+                    self.index, ret,
+                )
+                # Try to recover: re-link the old branch.
+                if old_branch:
+                    old_src_pad = old_branch[-1].get_static_pad("src")
+                    if old_src_pad is not None:
+                        old_src_pad.link(self.compositor_pad)
+                    for el in old_branch:
+                        el.sync_state_with_parent()
+                # Discard shadow branch.
+                for el in shadow_branch:
+                    el.set_state(Gst.State.NULL)
+                    self.pipeline.remove(el)
+                for el in shadow_aux:
+                    el.set_state(Gst.State.NULL)
+                    self.pipeline.remove(el)
+                shadow_fakesink.set_state(Gst.State.NULL)
+                self.pipeline.remove(shadow_fakesink)
+                return False
+
+        # --- Step 6: Resume shadow elements. ---
+        for el in shadow_branch:
+            el.sync_state_with_parent()
+
+        # --- Step 7: Promote shadow as the active branch. ---
+        self._branch = shadow_branch
+        self._aux_elements = shadow_aux
+        self._current_idx = next_idx
+        self._last_frame_time = 0.0
+        self._stream_start_time = time.monotonic()
+
+        # --- Step 8: Install watchdog probe on the newly active branch. ---
+        if shadow_src_pad is not None:
+            shadow_src_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_frame_probe)
+
+        log.info(
+            "Cell %d: hot-swap complete → stream %d (%s)",
+            self.index, next_idx,
+            self._stream_display(self.cell_cfg.streams[next_idx], next_idx),
+        )
+
+        # --- Step 9: Tear down old branch and aux elements. ---
+        if old_branch:
+            for el in old_branch:
+                el.set_state(Gst.State.NULL)
+            for el in old_branch:
+                self.pipeline.remove(el)
+            log.debug(
+                "Cell %d: old branch removed (%d elements)", self.index, len(old_branch)
+            )
+        for el in old_aux:
+            el.set_state(Gst.State.NULL)
+            self.pipeline.remove(el)
+        if old_aux:
+            log.debug(
+                "Cell %d: removed %d old auxiliary element(s)", self.index, len(old_aux)
+            )
+
+        # Tear down the temporary shadow fakesink.
+        shadow_fakesink.set_state(Gst.State.NULL)
+        self.pipeline.remove(shadow_fakesink)
+
+        return False  # GLib.SOURCE_REMOVE — run once only
+
+    def _abort_preload(self) -> None:
+        """Tear down the shadow branch without swapping it in.
+
+        Called by stop() (pipeline shutdown) or _on_preload_timeout() (fallback).
+        Cancels the fallback timer, sets all shadow elements to NULL, removes
+        them from the pipeline, and clears all _shadow_* fields.
+        """
+        if self._preload_timeout_id is not None:
+            GLib.source_remove(self._preload_timeout_id)
+            self._preload_timeout_id = None
+
+        self._preloading = False
+
+        shadow_branch = self._shadow_branch
+        shadow_fakesink = self._shadow_fakesink
+        shadow_aux = self._shadow_aux_elements
+
+        self._shadow_branch = []
+        self._shadow_fakesink = None
+        self._shadow_aux_elements = []
+
+        for el in shadow_branch:
+            el.set_state(Gst.State.NULL)
+        for el in shadow_branch:
+            self.pipeline.remove(el)
+
+        for el in shadow_aux:
+            el.set_state(Gst.State.NULL)
+            self.pipeline.remove(el)
+
+        if shadow_fakesink is not None:
+            shadow_fakesink.set_state(Gst.State.NULL)
+            self.pipeline.remove(shadow_fakesink)
+
+        n_removed = len(shadow_branch) + len(shadow_aux) + (
+            1 if shadow_fakesink is not None else 0
+        )
+        if n_removed:
+            log.debug(
+                "Cell %d: shadow branch aborted (%d elements removed)",
+                self.index, n_removed,
+            )
+
+    def _on_preload_timeout(self) -> bool:
+        """GLib timer: shadow branch did not produce a frame within the timeout.
+
+        Tears down the shadow branch and falls back to a direct teardown+reconnect
+        of the next stream (original rotation behaviour).
+
+        Returns False (GLib.SOURCE_REMOVE) — the timer is not repeated.
+        """
+        # Mark the timeout as fired so _abort_preload doesn't try to cancel it.
+        self._preload_timeout_id = None
+
+        next_idx = self._shadow_next_idx
+        next_url = self.cell_cfg.streams[next_idx]
+
+        log.warning(
+            "Cell %d: preload timed out after %ds — falling back to direct swap "
+            "→ stream %d (%s)",
+            self.index, self._preload_timeout, next_idx,
+            self._stream_display(next_url, next_idx),
+        )
+
+        self._abort_preload()
+
+        # Direct swap: tear down current stream, connect next directly.
+        self._current_idx = next_idx
         self._teardown_branch()
         try:
             self._connect_stream(next_url)
         except Exception as exc:
-            log.error("Cell %d: failed to connect new stream: %s", self.index, exc)
+            log.error(
+                "Cell %d: direct swap failed after preload timeout: %s", self.index, exc
+            )
 
-        return True  # keep timer running
+        return False  # GLib.SOURCE_REMOVE

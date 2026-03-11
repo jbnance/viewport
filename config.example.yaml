@@ -22,6 +22,9 @@ display:
   cols: 2         # grid columns (default: 2)
   # connector_id: 42  # DRM connector ID for kmssink.  Omit for auto-detect.
                       # Run `modetest -c` on the Pi to list available IDs.
+  # preload_timeout: 10  # Seconds to wait for a preloaded stream's first decoded
+                         # frame before giving up and falling back to a direct swap.
+                         # Increase for slow cameras; decrease for fast local cameras.
 
 # ---------------------------------------------------------------------------
 # Decoder settings

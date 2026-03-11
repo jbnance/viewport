@@ -100,6 +100,7 @@ def main() -> int:
             decoders=decoders,
             pipeline=vp.pipeline,
             compositor_pad=vp.get_compositor_pad(i),
+            preload_timeout=config.display.preload_timeout,
         )
         cells.append(cell)
 
