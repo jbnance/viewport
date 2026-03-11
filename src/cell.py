@@ -154,6 +154,11 @@ class Cell:
         # _preloading is True from _start_preload() until the first shadow frame
         # arrives or the timeout fires; it gates the idle_add in the probe so
         # the swap is only scheduled once.
+        # _rotation_attempt_start records _current_idx at the beginning of each
+        # rotation timer tick.  When a preload fails, _on_preload_timeout()
+        # immediately tries the next stream; _rotation_attempt_start lets it
+        # detect when it has gone all the way around the list without success
+        # and should stop rather than loop forever.  -1 = not in a rotation cycle.
         self._shadow_branch: list[Gst.Element] = []
         self._shadow_fakesink: Optional[Gst.Element] = None
         self._shadow_aux_elements: list[Gst.Element] = []
@@ -161,6 +166,7 @@ class Cell:
         self._preloading: bool = False
         self._preload_timeout_id: Optional[int] = None
         self._preload_timeout: int = preload_timeout
+        self._rotation_attempt_start: int = -1
 
     # ------------------------------------------------------------------
     # Public API
@@ -608,6 +614,9 @@ class Cell:
         next_idx = (self._current_idx + 1) % len(self.cell_cfg.streams)
         next_url = self.cell_cfg.streams[next_idx]
         self._shadow_next_idx = next_idx
+        # Mark the start of this rotation cycle so _on_preload_timeout can detect
+        # when it has tried every alternative without success (full circle).
+        self._rotation_attempt_start = self._current_idx
 
         log.info(
             "Cell %d: preloading stream %d (%s)",
@@ -618,16 +627,12 @@ class Cell:
             self._start_preload(next_idx)
         except Exception as exc:
             log.error(
-                "Cell %d: preload failed to start (%s) — falling back to direct swap",
-                self.index, exc,
+                "Cell %d: preload failed to start (%s) — skipping stream %d",
+                self.index, exc, next_idx,
             )
-            # Fall back: direct teardown + reconnect (original behaviour).
+            # Skip this stream — advance the index and let the timer try the
+            # next one on the following tick (consistent with timeout behaviour).
             self._current_idx = next_idx
-            self._teardown_branch()
-            try:
-                self._connect_stream(next_url)
-            except Exception as exc2:
-                log.error("Cell %d: direct swap also failed: %s", self.index, exc2)
 
         return True  # keep timer running
 
@@ -813,6 +818,7 @@ class Cell:
         self._branch = shadow_branch
         self._aux_elements = shadow_aux
         self._current_idx = next_idx
+        self._rotation_attempt_start = -1  # successful swap — fresh cycle next time
         self._last_frame_time = 0.0
         self._stream_start_time = time.monotonic()
 
@@ -896,32 +902,66 @@ class Cell:
         """GLib timer: shadow branch did not produce a frame within the timeout.
 
         The target stream is unavailable (camera unreachable, codec mismatch, etc.).
-        Rather than tearing down the current stream and connecting to a dead camera
-        — which would freeze the cell for rotation_interval seconds — we simply
-        discard the shadow branch, advance the rotation index past the failed stream,
-        and let the current stream continue displaying.  The next rotation timer tick
-        will try the following stream in the list.
+        The shadow branch is discarded and we immediately try to preload the *next*
+        stream in the list, so unavailable streams are skipped as fast as possible
+        rather than waiting a full rotation_interval per failure.
+
+        A full-circle guard prevents an infinite loop when every alternative is also
+        unavailable: once every stream index has been tried within a single rotation
+        cycle (detected by next_next_idx wrapping back to _rotation_attempt_start),
+        we stop and let the currently-displaying stream continue until the next
+        rotation timer tick gives the cycle another chance.
 
         Returns False (GLib.SOURCE_REMOVE) — the timer is not repeated.
         """
         # Mark the timeout as fired so _abort_preload doesn't try to cancel it.
         self._preload_timeout_id = None
 
-        next_idx = self._shadow_next_idx
-        next_url = self.cell_cfg.streams[next_idx]
+        failed_idx = self._shadow_next_idx
+        failed_url = self.cell_cfg.streams[failed_idx]
 
         log.warning(
-            "Cell %d: preload timed out after %ds — skipping unavailable stream %d (%s), "
-            "current stream stays active",
-            self.index, self._preload_timeout, next_idx,
-            self._stream_display(next_url, next_idx),
+            "Cell %d: preload timed out after %ds — stream %d (%s) unavailable, "
+            "trying next stream immediately",
+            self.index, self._preload_timeout, failed_idx,
+            self._stream_display(failed_url, failed_idx),
         )
 
         self._abort_preload()
 
-        # Advance the rotation index past the failed stream so the next timer
-        # tick tries the one after it instead of immediately retrying this one.
-        # The current branch is left running — no visible interruption.
-        self._current_idx = next_idx
+        # Advance past the failed stream.
+        self._current_idx = failed_idx
+
+        # Full-circle guard: if the next candidate wraps back to where this
+        # rotation cycle started, every alternative has been tried and all are
+        # down.  Stop here; the current stream keeps displaying and the next
+        # rotation timer tick will start a fresh cycle.
+        next_idx = (self._current_idx + 1) % len(self.cell_cfg.streams)
+        if next_idx == self._rotation_attempt_start:
+            log.warning(
+                "Cell %d: all %d streams unavailable — current stream stays active",
+                self.index, len(self.cell_cfg.streams),
+            )
+            self._rotation_attempt_start = -1
+            return False  # GLib.SOURCE_REMOVE
+
+        # Immediately start preloading the next stream.
+        next_url = self.cell_cfg.streams[next_idx]
+        self._shadow_next_idx = next_idx
+        log.info(
+            "Cell %d: preloading stream %d (%s)",
+            self.index, next_idx, self._stream_display(next_url, next_idx),
+        )
+        try:
+            self._start_preload(next_idx)
+        except Exception as exc:
+            log.error(
+                "Cell %d: preload failed to start for stream %d (%s): %s",
+                self.index, next_idx, self._stream_display(next_url, next_idx), exc,
+            )
+            # Treat a build failure the same as a timeout — advance and the
+            # next timer tick will pick up from here.
+            self._current_idx = next_idx
+            self._rotation_attempt_start = -1
 
         return False  # GLib.SOURCE_REMOVE
