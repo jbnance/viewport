@@ -18,6 +18,8 @@ display:
                   # stream framerate (UniFi Protect high-quality = 15 or 20 fps).
                   # This MUST be set: without it the compositor waits for all 6
                   # RTSP clocks to agree on a timestamp, producing <1 fps output.
+  rows: 3         # grid rows    (default: 3)
+  cols: 2         # grid columns (default: 2)
   # connector_id: 42  # DRM connector ID for kmssink.  Omit for auto-detect.
                       # Run `modetest -c` on the Pi to list available IDs.
 
@@ -65,9 +67,9 @@ groups:
   garage_area: [garage, side_gate]
 
 # ---------------------------------------------------------------------------
-# Cells — exactly 6 entries (3 rows × 2 columns).
+# Cells — placed left-to-right, top-to-bottom into the rows×cols grid.
 #
-# Grid layout:
+# Grid layout (default 3 rows × 2 cols):
 #   ┌────────────┬────────────┐
 #   │  cells[0]  │  cells[1]  │  row 0
 #   ├────────────┼────────────┤
@@ -80,13 +82,16 @@ groups:
 #   streams:            list of stream references (required, at least one)
 #   rotation_interval:  seconds between stream switches (default: 0 = disabled)
 #   codec:              h264 (default) or h265
+#   col_span:           number of grid columns this cell occupies (default: 1)
+#   row_span:           number of grid rows    this cell occupies (default: 1)
 #
 # Each item in a streams list is resolved in order:
 #   1. Contains "://"  →  used as a raw RTSP URL
 #   2. Matches a name in the streams section  →  resolved to its URL
 #   3. Matches a name in the groups section  →  expanded to all member URLs
 #
-# If you configure fewer than 6 cells, the remaining cells show black.
+# Null entries (a bare '-' with no keys) skip one grid slot (shows black).
+# If you configure fewer cells than rows×cols, remaining slots show black.
 # ---------------------------------------------------------------------------
 cells:
   # Cell 0 — top-left: single named stream
@@ -110,7 +115,7 @@ cells:
       - rtsp://192.168.1.110/stream1   # raw URL (backward compatible)
     rotation_interval: 15
 
-  # Cell 4 — bottom-left: raw URLs only (backward compatible, no named streams needed)
+  # Cell 4 — bottom-left: raw URLs only (backward compatible)
   - streams:
       - rtsp://192.168.1.106/stream1
       - rtsp://192.168.1.107/stream1
@@ -119,3 +124,25 @@ cells:
   # Cell 5 — bottom-right: raw URL with embedded credentials
   - streams:
       - rtsp://admin:password@192.168.1.108/stream1
+
+# ---------------------------------------------------------------------------
+# Example: merged-cell layout
+#
+# To use this layout, set rows: 2, cols: 3 in the display section above, then
+# replace the cells block with the one below.
+#
+# Visual result (2 rows × 3 cols = 1920×1080 display, cells 320×540 each):
+#   ┌──────────────────────┬──────┬──────┐
+#   │                      │  B   │  C   │
+#   │          A           ├──────┼──────┤
+#   │      (col_span: 2)   │  D   │  E   │
+#   └──────────────────────┴──────┴──────┘
+#
+# cells:
+#   - streams: [front_door]   # A — spans 2 rows, 1 column (left side)
+#     row_span: 2
+#   - streams: [back_yard]    # B — top-center
+#   - streams: [driveway]     # C — top-right
+#   - streams: [garage]       # D — bottom-center
+#   - streams: [side_gate]    # E — bottom-right
+# ---------------------------------------------------------------------------

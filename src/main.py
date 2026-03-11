@@ -100,8 +100,6 @@ def main() -> int:
             decoders=decoders,
             pipeline=vp.pipeline,
             compositor_pad=vp.get_compositor_pad(i),
-            cell_width=config.display.cell_width,
-            cell_height=config.display.cell_height,
         )
         cells.append(cell)
 

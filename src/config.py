@@ -11,10 +11,6 @@ import yaml
 
 log = logging.getLogger(__name__)
 
-GRID_ROWS = 3
-GRID_COLS = 2
-CELL_COUNT = GRID_ROWS * GRID_COLS
-
 
 @dataclass
 class DisplayConfig:
@@ -28,17 +24,30 @@ class DisplayConfig:
     # switches the compositor to a fixed-interval timer that composites
     # whatever frame each pad currently has every 1/framerate seconds.
     framerate: int = 15
+    # Grid dimensions — number of rows and columns in the display layout.
+    # Each cell occupies one slot; cells with row_span/col_span > 1 span
+    # multiple slots.  Defaults to the original 3×2 layout.
+    rows: int = 3
+    cols: int = 2
     # DRM connector ID for kmssink.  None = auto-detect (works for most setups).
     # Run `modetest -c` on the Pi to list available connector IDs.
     connector_id: Optional[int] = None
 
+    def __post_init__(self) -> None:
+        if self.rows < 1 or self.cols < 1:
+            raise ValueError(
+                f"display rows and cols must each be >= 1, got {self.rows}×{self.cols}"
+            )
+
     @property
     def cell_width(self) -> int:
-        return self.width // GRID_COLS
+        """Width of one 1×1 grid cell in pixels."""
+        return self.width // self.cols
 
     @property
     def cell_height(self) -> int:
-        return self.height // GRID_ROWS
+        """Height of one 1×1 grid cell in pixels."""
+        return self.height // self.rows
 
 
 @dataclass
@@ -63,10 +72,17 @@ class CellConfig:
     streams: list[str]           # resolved RTSP URLs
     rotation_interval: int = 0   # seconds; 0 = no rotation
     codec: str = "h264"          # "h264" or "h265"
+    # Cell span — how many grid columns / rows this cell occupies.
+    # Defaults to 1×1 (a single slot).  Auto-placement handles positioning.
+    col_span: int = 1
+    row_span: int = 1
     # Human-readable label for each resolved URL, parallel to streams[].
     # label[i] == streams[i] means the stream has no name (raw URL).
     # Used only for log messages; empty list is valid (falls back to URL).
     stream_labels: list[str] = field(default_factory=list)
+    # Grid position — set by _autoplace_cells() in load_config(), not by the user.
+    row: int = field(default=0, init=False)
+    col: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
         if not self.streams:
@@ -76,6 +92,11 @@ class CellConfig:
             raise ValueError(f"codec must be 'h264' or 'h265', got '{self.codec}'")
         if self.rotation_interval < 0:
             raise ValueError("rotation_interval must be >= 0")
+        if self.col_span < 1 or self.row_span < 1:
+            raise ValueError(
+                f"col_span and row_span must each be >= 1, "
+                f"got col_span={self.col_span} row_span={self.row_span}"
+            )
         if len(self.streams) == 1:
             if self.rotation_interval != 0:
                 log.warning(
@@ -93,22 +114,8 @@ class AppConfig:
     log_level: str = "INFO"   # DEBUG | INFO | WARNING | ERROR
 
     def __post_init__(self) -> None:
-        if len(self.cells) > CELL_COUNT:
-            raise ValueError(
-                f"Too many cells configured ({len(self.cells)}); maximum is {CELL_COUNT}"
-            )
-        # Pad with blank placeholder cells if fewer than CELL_COUNT are given.
-        # Blank cells show black; they have no streams and no rotation.
-        blank_count = CELL_COUNT - len(self.cells)
-        while len(self.cells) < CELL_COUNT:
-            self.cells.append(None)  # type: ignore[arg-type]
-        if blank_count:
-            log.debug(
-                "%d blank placeholder cell(s) added to fill %d×%d grid",
-                blank_count,
-                GRID_ROWS,
-                GRID_COLS,
-            )
+        if not self.cells:
+            raise ValueError("At least one cell must be configured")
 
         valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR"}
         self.log_level = self.log_level.upper()
@@ -118,7 +125,76 @@ class AppConfig:
             )
 
 
-_BLANK_CELL: Optional[CellConfig] = None  # sentinel for empty cells
+def _autoplace_cells(
+    raw_cells: list,
+    rows: int,
+    cols: int,
+) -> list[CellConfig]:
+    """Auto-place cells in the grid using row-major (left-to-right, top-to-bottom) order.
+
+    Each cell is placed at the first available rectangular block that fits its
+    col_span × row_span.  Null entries in *raw_cells* advance the cursor by one
+    1×1 slot without producing a cell (blank/black area).
+
+    Sets .row and .col on each CellConfig in-place; returns only the non-null cells.
+    Raises ValueError if any cell cannot be placed (grid too full or span too large).
+    """
+    occupied = [[False] * cols for _ in range(rows)]
+    cursor_row, cursor_col = 0, 0
+    result: list[CellConfig] = []
+
+    def _advance() -> None:
+        nonlocal cursor_row, cursor_col
+        cursor_col += 1
+        if cursor_col >= cols:
+            cursor_col = 0
+            cursor_row += 1
+
+    def _fits(r: int, c: int, rs: int, cs: int) -> bool:
+        if r + rs > rows or c + cs > cols:
+            return False
+        return all(
+            not occupied[r + dr][c + dc]
+            for dr in range(rs)
+            for dc in range(cs)
+        )
+
+    for idx, raw in enumerate(raw_cells):
+        rs = 1 if raw is None else raw.row_span
+        cs = 1 if raw is None else raw.col_span
+
+        if cs > cols or rs > rows:
+            raise ValueError(
+                f"Cell {idx}: span {rs}×{cs} exceeds grid size {rows}×{cols}"
+            )
+
+        placed = False
+        while cursor_row + rs <= rows:
+            if _fits(cursor_row, cursor_col, rs, cs):
+                if raw is not None:
+                    raw.row = cursor_row
+                    raw.col = cursor_col
+                    result.append(raw)
+                for dr in range(rs):
+                    for dc in range(cs):
+                        occupied[cursor_row + dr][cursor_col + dc] = True
+                # Advance cursor past this cell's right edge
+                cursor_col += cs
+                if cursor_col >= cols:
+                    cursor_col = 0
+                    cursor_row += 1
+                placed = True
+                break
+            _advance()
+
+        if not placed:
+            which = "null placeholder" if raw is None else f"cell {idx}"
+            raise ValueError(
+                f"Layout error: {which} (span {rs}×{cs}) does not fit in the "
+                f"remaining {rows}×{cols} grid space — check spans and cell count"
+            )
+
+    return result
 
 
 def load_config(path: str) -> AppConfig:
@@ -140,6 +216,8 @@ def load_config(path: str) -> AppConfig:
         width=int(disp_raw.get("width", 1920)),
         height=int(disp_raw.get("height", 1080)),
         framerate=int(disp_raw.get("framerate", 15)),
+        rows=int(disp_raw.get("rows", 3)),
+        cols=int(disp_raw.get("cols", 2)),
         connector_id=int(raw_connector) if raw_connector is not None else None,
     )
 
@@ -211,10 +289,10 @@ def load_config(path: str) -> AppConfig:
     # Cells
     # ------------------------------------------------------------------
     cells_raw = raw.get("cells", [])
-    cells: list[CellConfig] = []
+    parsed_cells: list = []   # CellConfig or None (null placeholder)
     for i, c in enumerate(cells_raw):
         if c is None:
-            cells.append(None)  # type: ignore[arg-type]
+            parsed_cells.append(None)
             continue
         try:
             if "streams" not in c:
@@ -254,16 +332,24 @@ def load_config(path: str) -> AppConfig:
                 len(resolved_streams),
                 ", ".join(resolved_labels),
             )
-            cells.append(
+            parsed_cells.append(
                 CellConfig(
                     streams=resolved_streams,
                     stream_labels=resolved_labels,
                     rotation_interval=int(c.get("rotation_interval", 0)),
                     codec=str(c.get("codec", "h264")),
+                    col_span=int(c.get("col_span", 1)),
+                    row_span=int(c.get("row_span", 1)),
                 )
             )
         except (KeyError, ValueError) as exc:
             raise ValueError(f"Invalid cell config at index {i}: {exc}") from exc
+
+    # Auto-place cells into the grid (sets .row / .col on each CellConfig)
+    try:
+        cells = _autoplace_cells(parsed_cells, display.rows, display.cols)
+    except ValueError as exc:
+        raise ValueError(f"Grid layout error: {exc}") from exc
 
     cfg = AppConfig(
         display=display,
@@ -272,10 +358,12 @@ def load_config(path: str) -> AppConfig:
         log_level=str(raw.get("log_level", "INFO")),
     )
     log.info(
-        "Loaded config: %dx%d @ %d fps display, %d cell(s) configured",
+        "Loaded config: %dx%d @ %d fps, %d×%d grid, %d cell(s)",
         display.width,
         display.height,
         display.framerate,
-        sum(1 for c in cfg.cells if c is not None),
+        display.rows,
+        display.cols,
+        len(cfg.cells),
     )
     return cfg

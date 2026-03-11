@@ -115,20 +115,16 @@ class Cell:
     def __init__(
         self,
         index: int,
-        cell_cfg: Optional[CellConfig],
+        cell_cfg: CellConfig,
         decoders: ResolvedDecoders,
         pipeline: Gst.Pipeline,
         compositor_pad: Gst.Pad,
-        cell_width: int,
-        cell_height: int,
     ) -> None:
         self.index = index
         self.cell_cfg = cell_cfg
         self._decoders = decoders
         self.pipeline = pipeline
         self.compositor_pad = compositor_pad
-        self.cell_width = cell_width
-        self.cell_height = cell_height
 
         self._current_idx: int = 0
         self._branch: list[Gst.Element] = []
@@ -150,10 +146,6 @@ class Cell:
 
     def start(self) -> None:
         """Add the initial stream branch to the pipeline and schedule rotation."""
-        if self.cell_cfg is None:
-            log.debug("Cell %d: blank (no stream configured)", self.index)
-            return
-
         self._connect_stream(self.cell_cfg.streams[0])
 
         if (
@@ -197,7 +189,7 @@ class Cell:
 
     def _connect_stream(self, url: str) -> None:
         """Build a new branch for *url*, add it to the pipeline, and sync state."""
-        codec = self.cell_cfg.codec if self.cell_cfg else "h264"
+        codec = self.cell_cfg.codec
         log.info("Cell %d: connecting to %s (%s)", self.index,
                  self._stream_display(url, self._current_idx), codec)
 
@@ -393,10 +385,9 @@ class Cell:
 
     def _stream_display(self, url: str, idx: int) -> str:
         """Return 'label (url)' when the stream has a name, or just 'url' for raw URLs."""
-        if self.cell_cfg:
-            labels = self.cell_cfg.stream_labels
-            if labels and idx < len(labels) and labels[idx] != url:
-                return f"{labels[idx]} ({url})"
+        labels = self.cell_cfg.stream_labels
+        if labels and idx < len(labels) and labels[idx] != url:
+            return f"{labels[idx]} ({url})"
         return url
 
     @staticmethod
@@ -503,8 +494,8 @@ class Cell:
         Runs on the GLib main loop thread — safe for pipeline topology changes.
         Returns True to keep the timer running, False to cancel it.
         """
-        if self.cell_cfg is None or len(self.cell_cfg.streams) != 1:
-            return False  # mis-configured; cancel timer
+        if len(self.cell_cfg.streams) != 1:
+            return False  # rotating cell — watchdog not needed; cancel timer
 
         now = time.monotonic()
         if self._last_frame_time > 0.0:
@@ -548,7 +539,7 @@ class Cell:
         Runs on the GLib main loop thread — safe for pipeline topology changes.
         A brief black frame during the switch (~100 ms) is acceptable.
         """
-        if self.cell_cfg is None or len(self.cell_cfg.streams) <= 1:
+        if len(self.cell_cfg.streams) <= 1:
             return False  # stop timer
 
         next_idx = (self._current_idx + 1) % len(self.cell_cfg.streams)
