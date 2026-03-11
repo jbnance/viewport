@@ -23,11 +23,11 @@ import gi
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GLib", "2.0")
-from gi.repository import Gst, GLib  # noqa: E402
+from gi.repository import GLib, Gst  # noqa: E402
 
+from cell import Cell, detect_decoders
 from config import load_config
 from pipeline import ViewportPipeline
-from cell import Cell, detect_decoders
 
 
 def _setup_logging(level_name: str) -> None:

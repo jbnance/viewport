@@ -72,15 +72,16 @@ class ResolvedDecoders:
     Gst.ElementFactory.make(name) without re-probing hardware availability on
     every stream connection or reconnection.
     """
-    h264: str   # e.g. "v4l2slh264dec" or "avdec_h264"
-    h265: str   # e.g. "v4l2slh265dec" or "avdec_h265"
+
+    h264: str  # e.g. "v4l2slh264dec" or "avdec_h264"
+    h265: str  # e.g. "v4l2slh265dec" or "avdec_h265"
 
 
 @dataclass
 class CellConfig:
-    streams: list[str]           # resolved RTSP URLs
-    rotation_interval: int = 0   # seconds; 0 = no rotation
-    codec: str = "h264"          # "h264" or "h265"
+    streams: list[str]  # resolved RTSP URLs
+    rotation_interval: int = 0  # seconds; 0 = no rotation
+    codec: str = "h264"  # "h264" or "h265"
     # Cell span — how many grid columns / rows this cell occupies.
     # Defaults to 1×1 (a single slot).  Auto-placement handles positioning.
     col_span: int = 1
@@ -120,7 +121,7 @@ class AppConfig:
     display: DisplayConfig
     decoder: DecoderConfig
     cells: list[CellConfig]
-    log_level: str = "INFO"   # DEBUG | INFO | WARNING | ERROR
+    log_level: str = "INFO"  # DEBUG | INFO | WARNING | ERROR
 
     def __post_init__(self) -> None:
         if not self.cells:
@@ -162,11 +163,7 @@ def _autoplace_cells(
     def _fits(r: int, c: int, rs: int, cs: int) -> bool:
         if r + rs > rows or c + cs > cols:
             return False
-        return all(
-            not occupied[r + dr][c + dc]
-            for dr in range(rs)
-            for dc in range(cs)
-        )
+        return all(not occupied[r + dr][c + dc] for dr in range(rs) for dc in range(cs))
 
     for idx, raw in enumerate(raw_cells):
         rs = 1 if raw is None else raw.row_span
@@ -299,7 +296,7 @@ def load_config(path: str) -> AppConfig:
     # Cells
     # ------------------------------------------------------------------
     cells_raw = raw.get("cells", [])
-    parsed_cells: list = []   # CellConfig or None (null placeholder)
+    parsed_cells: list = []  # CellConfig or None (null placeholder)
     for i, c in enumerate(cells_raw):
         if c is None:
             parsed_cells.append(None)

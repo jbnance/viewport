@@ -12,7 +12,7 @@ from typing import Optional
 import gi
 
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst, GLib  # noqa: E402 (must follow gi.require_version)
+from gi.repository import GLib, Gst  # noqa: E402 (must follow gi.require_version)
 
 from config import AppConfig
 
@@ -92,8 +92,8 @@ class ViewportPipeline:
         for idx, cell_cfg in enumerate(cfg.cells):
             pad_w = cell_cfg.col_span * cw
             pad_h = cell_cfg.row_span * ch
-            xpos  = cell_cfg.col * cw
-            ypos  = cell_cfg.row * ch
+            xpos = cell_cfg.col * cw
+            ypos = cell_cfg.row * ch
 
             pad_name = f"sink_{idx}"
             if hasattr(compositor, "request_pad_simple"):
@@ -101,17 +101,19 @@ class ViewportPipeline:
             else:
                 pad = compositor.get_request_pad(pad_name)
             if pad is None:
-                raise RuntimeError(
-                    f"compositor refused to create sink pad {idx}"
-                )
-            pad.set_property("xpos",   xpos)
-            pad.set_property("ypos",   ypos)
-            pad.set_property("width",  pad_w)
+                raise RuntimeError(f"compositor refused to create sink pad {idx}")
+            pad.set_property("xpos", xpos)
+            pad.set_property("ypos", ypos)
+            pad.set_property("width", pad_w)
             pad.set_property("height", pad_h)
             self._compositor_pads.append(pad)
             log.debug(
                 "Compositor pad %d: xpos=%d ypos=%d size=%dx%d",
-                idx, xpos, ypos, pad_w, pad_h,
+                idx,
+                xpos,
+                ypos,
+                pad_w,
+                pad_h,
             )
 
         # --- output: capsfilter → kmssink ---
@@ -148,7 +150,9 @@ class ViewportPipeline:
 
         log.debug(
             "Pipeline skeleton built: %d×%d grid, %d cell pad(s)",
-            cfg.display.rows, cfg.display.cols, len(cfg.cells),
+            cfg.display.rows,
+            cfg.display.cols,
+            len(cfg.cells),
         )
 
     # ------------------------------------------------------------------

@@ -63,7 +63,7 @@ from typing import Optional
 import gi
 
 gi.require_version("Gst", "1.0")
-from gi.repository import Gst, GLib  # noqa: E402
+from gi.repository import GLib, Gst  # noqa: E402
 
 from config import CellConfig, DecoderConfig, ResolvedDecoders
 
@@ -75,8 +75,8 @@ log = logging.getLogger(__name__)
 _branch_seq: int = 0
 
 # Watchdog parameters for single-URL cells.
-_STALE_SECS = 30   # seconds without a frame before reconnecting
-_WATCH_SECS = 10   # watchdog polling interval (seconds)
+_STALE_SECS = 30  # seconds without a frame before reconnecting
+_WATCH_SECS = 10  # watchdog polling interval (seconds)
 
 
 def _next_suffix(cell_idx: int) -> str:
@@ -94,6 +94,7 @@ def detect_decoders(dec_cfg: DecoderConfig) -> ResolvedDecoders:
     Cell so that each branch build simply does ElementFactory.make(known_name)
     without repeating the hardware-availability check.
     """
+
     def _pick(hw_name: Optional[str], sw_name: str, label: str) -> str:
         if hw_name is not None and Gst.ElementFactory.find(hw_name) is not None:
             log.info("Decoder (%s): hardware '%s' available", label, hw_name)
@@ -101,7 +102,9 @@ def detect_decoders(dec_cfg: DecoderConfig) -> ResolvedDecoders:
         if hw_name is not None:
             log.warning(
                 "Decoder (%s): hardware '%s' not available, falling back to software '%s'",
-                label, hw_name, sw_name,
+                label,
+                hw_name,
+                sw_name,
             )
         else:
             log.info("Decoder (%s): using software '%s'", label, sw_name)
@@ -144,7 +147,7 @@ class Cell:
         # Watchdog timestamps (monotonic).  Written by the pad probe on the
         # GStreamer streaming thread; read by the watchdog on the GLib main
         # loop thread.  A single float assignment is atomic under the GIL.
-        self._last_frame_time: float = 0.0    # 0.0 = no frame received yet
+        self._last_frame_time: float = 0.0  # 0.0 = no frame received yet
         self._stream_start_time: float = 0.0  # set when _connect_stream runs
 
         # Shadow branch state — used during preload-based rotation.
@@ -176,10 +179,7 @@ class Cell:
         """Add the initial stream branch to the pipeline and schedule rotation."""
         self._connect_stream(self.cell_cfg.streams[0])
 
-        if (
-            self.cell_cfg.rotation_interval > 0
-            and len(self.cell_cfg.streams) > 1
-        ):
+        if self.cell_cfg.rotation_interval > 0 and len(self.cell_cfg.streams) > 1:
             interval_ms = self.cell_cfg.rotation_interval * 1000
             self._rotation_source_id = GLib.timeout_add(
                 interval_ms, self._on_rotation_timer
@@ -221,8 +221,12 @@ class Cell:
     def _connect_stream(self, url: str) -> None:
         """Build a new branch for *url*, add it to the pipeline, and sync state."""
         codec = self.cell_cfg.codec
-        log.info("Cell %d: connecting to %s (%s)", self.index,
-                 self._stream_display(url, self._current_idx), codec)
+        log.info(
+            "Cell %d: connecting to %s (%s)",
+            self.index,
+            self._stream_display(url, self._current_idx),
+            codec,
+        )
 
         branch = self._build_branch(url, codec)
         for el in branch:
@@ -268,7 +272,9 @@ class Cell:
         for el in branch:
             self.pipeline.remove(el)
 
-        log.debug("Cell %d: branch torn down (%d elements removed)", self.index, len(branch))
+        log.debug(
+            "Cell %d: branch torn down (%d elements removed)", self.index, len(branch)
+        )
 
         # Step 4: Remove auxiliary elements (fakesinks for non-video RTP pads).
         # Must happen after step 2 so rtspsrc's audio pads are deactivated
@@ -303,11 +309,11 @@ class Cell:
 
         src = self._make("rtspsrc", f"src_{suffix}")
         src.set_property("location", url)
-        src.set_property("latency", 200)          # 200ms jitter buffer
+        src.set_property("latency", 200)  # 200ms jitter buffer
         # do-rtcp intentionally left at default (True): many cameras require receiving
         # RTCP receiver reports to confirm the connection is alive; without them
         # the camera may stop sending after 60-120 s.
-        src.set_property("protocols", 0x4)        # prefer TCP (4 = GST_RTSP_LOWER_TRANS_TCP)
+        src.set_property("protocols", 0x4)  # prefer TCP (4 = GST_RTSP_LOWER_TRANS_TCP)
         src.set_property("retry", 5)
         # Disable RTCP/RTP timestamp divergence check.  Some cameras produce RTCP
         # sender reports whose NTP-derived timestamps drift from the RTP timestamps;
@@ -344,7 +350,7 @@ class Cell:
         # default True) address the original cause of 30–60 s stalls, so leaky=2
         # is safe to restore here.
         out_queue.set_property("max-size-buffers", 2)
-        out_queue.set_property("leaky", 2)              # drop oldest when full
+        out_queue.set_property("leaky", 2)  # drop oldest when full
 
         branch = [src, depay, parser, decoder, videoconvert, out_queue]
 
@@ -497,7 +503,7 @@ class Cell:
                     caps_str[:60],
                 )
                 return
-            fakesink.set_property("sync", False)   # discard immediately, no clock wait
+            fakesink.set_property("sync", False)  # discard immediately, no clock wait
             fakesink.set_property("async", False)  # don't block pipeline preroll
             self.pipeline.add(fakesink)
             fakesink.sync_state_with_parent()
@@ -514,7 +520,9 @@ class Cell:
                     caps_str[:60],
                 )
             except Exception as exc:
-                log.warning("Cell %d: could not link non-video pad: %s", self.index, exc)
+                log.warning(
+                    "Cell %d: could not link non-video pad: %s", self.index, exc
+                )
                 fakesink.set_state(Gst.State.NULL)
                 self.pipeline.remove(fakesink)
             return
@@ -620,7 +628,9 @@ class Cell:
 
         log.info(
             "Cell %d: preloading stream %d (%s)",
-            self.index, next_idx, self._stream_display(next_url, next_idx),
+            self.index,
+            next_idx,
+            self._stream_display(next_url, next_idx),
         )
 
         try:
@@ -628,7 +638,9 @@ class Cell:
         except Exception as exc:
             log.error(
                 "Cell %d: preload failed to start (%s) — skipping stream %d",
-                self.index, exc, next_idx,
+                self.index,
+                exc,
+                next_idx,
             )
             # Skip this stream — advance the index and let the timer try the
             # next one on the following tick (consistent with timeout behaviour).
@@ -651,7 +663,8 @@ class Cell:
 
         log.debug(
             "Cell %d: building shadow branch for %s",
-            self.index, self._stream_display(url, next_idx),
+            self.index,
+            self._stream_display(url, next_idx),
         )
 
         # Build branch without the watchdog probe; the probe is installed by
@@ -662,7 +675,7 @@ class Cell:
         shadow_fakesink = Gst.ElementFactory.make("fakesink", None)
         if shadow_fakesink is None:
             raise RuntimeError(f"Cell {self.index}: failed to create shadow fakesink")
-        shadow_fakesink.set_property("sync", False)   # discard immediately
+        shadow_fakesink.set_property("sync", False)  # discard immediately
         shadow_fakesink.set_property("async", False)  # don't block pipeline preroll
 
         # Store shadow state BEFORE adding elements to the pipeline so that
@@ -790,7 +803,8 @@ class Cell:
                 log.error(
                     "Cell %d: shadow → compositor link failed (%s); "
                     "re-linking old branch and aborting swap",
-                    self.index, ret,
+                    self.index,
+                    ret,
                 )
                 # Try to recover: re-link the old branch.
                 if old_branch:
@@ -828,7 +842,8 @@ class Cell:
 
         log.info(
             "Cell %d: hot-swap complete → stream %d (%s)",
-            self.index, next_idx,
+            self.index,
+            next_idx,
             self._stream_display(self.cell_cfg.streams[next_idx], next_idx),
         )
 
@@ -889,13 +904,16 @@ class Cell:
             shadow_fakesink.set_state(Gst.State.NULL)
             self.pipeline.remove(shadow_fakesink)
 
-        n_removed = len(shadow_branch) + len(shadow_aux) + (
-            1 if shadow_fakesink is not None else 0
+        n_removed = (
+            len(shadow_branch)
+            + len(shadow_aux)
+            + (1 if shadow_fakesink is not None else 0)
         )
         if n_removed:
             log.debug(
                 "Cell %d: shadow branch aborted (%d elements removed)",
-                self.index, n_removed,
+                self.index,
+                n_removed,
             )
 
     def _on_preload_timeout(self) -> bool:
@@ -923,7 +941,9 @@ class Cell:
         log.warning(
             "Cell %d: preload timed out after %ds — stream %d (%s) unavailable, "
             "trying next stream immediately",
-            self.index, self._preload_timeout, failed_idx,
+            self.index,
+            self._preload_timeout,
+            failed_idx,
             self._stream_display(failed_url, failed_idx),
         )
 
@@ -940,7 +960,8 @@ class Cell:
         if next_idx == self._rotation_attempt_start:
             log.warning(
                 "Cell %d: all %d streams unavailable — current stream stays active",
-                self.index, len(self.cell_cfg.streams),
+                self.index,
+                len(self.cell_cfg.streams),
             )
             self._rotation_attempt_start = -1
             return False  # GLib.SOURCE_REMOVE
@@ -950,14 +971,19 @@ class Cell:
         self._shadow_next_idx = next_idx
         log.info(
             "Cell %d: preloading stream %d (%s)",
-            self.index, next_idx, self._stream_display(next_url, next_idx),
+            self.index,
+            next_idx,
+            self._stream_display(next_url, next_idx),
         )
         try:
             self._start_preload(next_idx)
         except Exception as exc:
             log.error(
                 "Cell %d: preload failed to start for stream %d (%s): %s",
-                self.index, next_idx, self._stream_display(next_url, next_idx), exc,
+                self.index,
+                next_idx,
+                self._stream_display(next_url, next_idx),
+                exc,
             )
             # Treat a build failure the same as a timeout — advance and the
             # next timer tick will pick up from here.
