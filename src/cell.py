@@ -895,8 +895,12 @@ class Cell:
     def _on_preload_timeout(self) -> bool:
         """GLib timer: shadow branch did not produce a frame within the timeout.
 
-        Tears down the shadow branch and falls back to a direct teardown+reconnect
-        of the next stream (original rotation behaviour).
+        The target stream is unavailable (camera unreachable, codec mismatch, etc.).
+        Rather than tearing down the current stream and connecting to a dead camera
+        — which would freeze the cell for rotation_interval seconds — we simply
+        discard the shadow branch, advance the rotation index past the failed stream,
+        and let the current stream continue displaying.  The next rotation timer tick
+        will try the following stream in the list.
 
         Returns False (GLib.SOURCE_REMOVE) — the timer is not repeated.
         """
@@ -907,22 +911,17 @@ class Cell:
         next_url = self.cell_cfg.streams[next_idx]
 
         log.warning(
-            "Cell %d: preload timed out after %ds — falling back to direct swap "
-            "→ stream %d (%s)",
+            "Cell %d: preload timed out after %ds — skipping unavailable stream %d (%s), "
+            "current stream stays active",
             self.index, self._preload_timeout, next_idx,
             self._stream_display(next_url, next_idx),
         )
 
         self._abort_preload()
 
-        # Direct swap: tear down current stream, connect next directly.
+        # Advance the rotation index past the failed stream so the next timer
+        # tick tries the one after it instead of immediately retrying this one.
+        # The current branch is left running — no visible interruption.
         self._current_idx = next_idx
-        self._teardown_branch()
-        try:
-            self._connect_stream(next_url)
-        except Exception as exc:
-            log.error(
-                "Cell %d: direct swap failed after preload timeout: %s", self.index, exc
-            )
 
         return False  # GLib.SOURCE_REMOVE
