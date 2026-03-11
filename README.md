@@ -2,10 +2,11 @@
 
 Headless RTSP multi-stream display for Raspberry Pi 4+.
 
-Displays up to **6 RTSP video streams** in a **3 rows × 2 columns** grid on a
-1080p display.  Output goes directly to the GPU via DRM/KMS — no X11, Wayland,
-or display manager required.  Each grid cell can show a single stream or rotate
-through a list of streams on a configurable timer.
+Displays any number of RTSP video streams in a configurable grid on a connected
+monitor.  Output goes directly to the GPU via DRM/KMS — no X11, Wayland, or
+display manager required.
+
+Default layout (3 rows × 2 columns):
 
 ```
 ┌──────────────┬──────────────┐
@@ -16,6 +17,11 @@ through a list of streams on a configurable timer.
 │   stream 4   │   stream 5   │
 └──────────────┴──────────────┘
 ```
+
+Grid dimensions, cell sizes, and spanning are all configurable in YAML.  Each
+cell can show a single stream or rotate through a playlist on a timer.  When
+rotating, the next stream is preloaded in the background so the transition
+appears seamless — the current stream stays visible until the new one is ready.
 
 ## Requirements
 
@@ -68,47 +74,147 @@ sudo nano /etc/viewport/config.yaml   # add your RTSP stream URLs
 
 ## Configuration
 
-See `config.example.yaml` for a fully-documented example.  The key section is
-`cells`, which defines one entry per grid position:
+See `config.example.yaml` for a fully-documented reference.  The sections below
+describe each part of the config file.
+
+### Top-level keys
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `log_level` | `INFO` | Verbosity: `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
+
+### `display:`
+
+Controls the output resolution, grid layout, and rotation behaviour.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `width` | `1920` | Output width in pixels (must match your display) |
+| `height` | `1080` | Output height in pixels (must match your display) |
+| `framerate` | `15` | Compositor output framerate (fps) — must be set; see note below |
+| `rows` | `3` | Number of grid rows |
+| `cols` | `2` | Number of grid columns |
+| `connector_id` | *(auto)* | DRM connector ID for `kmssink`; omit for auto-detect |
+| `preload_timeout` | `10` | Seconds to wait for a preloaded stream's first frame before skipping it |
+
+> **Why `framerate` must be set:** Without it, the GStreamer compositor waits for
+> all input pads to produce a frame at the *same* timestamp before compositing.
+> Six independent RTSP clocks almost never agree, so the output drops to <1 fps
+> despite available CPU.  Setting `framerate` switches the compositor to a
+> fixed-interval timer that composites whatever frame each pad currently has.
 
 ```yaml
-cells:
-  # Single stream — no rotation
-  - streams:
-      - rtsp://192.168.1.100/stream1
-
-  # Rotation — switches every 30 seconds
-  - streams:
-      - rtsp://192.168.1.101/cam1
-      - rtsp://192.168.1.102/cam2
-    rotation_interval: 30
-
-  # H.265 / HEVC stream
-  - streams:
-      - rtsp://192.168.1.103/stream1
-    codec: h265
-
-  # Camera with credentials embedded in URL
-  - streams:
-      - rtsp://admin:password@192.168.1.104/stream1
-
-  - streams: [rtsp://192.168.1.105/stream1]
-  - streams: [rtsp://192.168.1.106/stream1]
+display:
+  width: 1920
+  height: 1080
+  framerate: 15
+  rows: 3
+  cols: 2
+  # connector_id: 42      # run `modetest -c` to list available IDs
+  # preload_timeout: 10   # increase for slow/remote cameras
 ```
+
+### `decoder:`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `prefer_hardware` | `true` | Use `v4l2slh264dec` / `v4l2slh265dec` when available; fall back to `avdec_*` |
+
+### `streams:` (optional)
+
+A named registry that maps friendly names to RTSP URLs.  Names can be used
+anywhere a raw URL is accepted — in cells and as group members.
+
+```yaml
+streams:
+  front_door: rtsp://192.168.1.100/stream1
+  back_yard:  rtsp://192.168.1.101/stream1
+  driveway:   rtsp://192.168.1.102/stream1
+```
+
+### `groups:` (optional)
+
+Maps group names to lists of stream names or raw URLs.  A group referenced in a
+cell's `streams` list is expanded (flattened) inline to all of its member URLs.
+
+```yaml
+groups:
+  exterior: [front_door, back_yard, driveway]
+```
+
+Groups cannot reference other groups.  Group names must not clash with stream names.
+
+### `cells:`
+
+A list of cell definitions placed left-to-right, top-to-bottom into the grid.
+A bare `-` (null entry) skips one slot, leaving it black.  Cells with fewer
+entries than `rows × cols` leave the remaining slots black.
+
+Each item in a cell's `streams` list is resolved as:
+1. Contains `://` → used as a raw RTSP URL
+2. Matches a name in `streams:` → resolved to its URL
+3. Matches a name in `groups:` → expanded to all member URLs in order
 
 **Cell options:**
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `streams` | *(required)* | List of RTSP URLs for this cell |
+| `streams` | *(required)* | List of stream references (URLs, named streams, or groups) |
 | `rotation_interval` | `0` | Seconds between stream switches; `0` disables rotation |
 | `codec` | `h264` | `h264` or `h265` |
+| `col_span` | `1` | Number of grid columns this cell occupies |
+| `row_span` | `1` | Number of grid rows this cell occupies |
 
-**Decoder options:**
+**Example cells block:**
 
 ```yaml
-decoder:
-  prefer_hardware: true   # use v4l2slh264dec/v4l2slh265dec when available
+cells:
+  # Single named stream — no rotation
+  - streams:
+      - front_door
+
+  # Rotate through all cameras in the 'exterior' group every 20 s
+  - streams:
+      - exterior
+    rotation_interval: 20
+
+  # H.265 stream
+  - streams:
+      - rtsp://192.168.1.103/stream1
+    codec: h265
+
+  # Camera with embedded credentials
+  - streams:
+      - rtsp://admin:password@192.168.1.104/stream1
+
+  # Wide cell spanning 2 columns
+  - streams:
+      - back_yard
+    col_span: 2
+```
+
+**Merged-cell layout example** (2 rows × 3 cols):
+
+```
+┌──────────────────────┬──────┬──────┐
+│                      │  B   │  C   │
+│          A           ├──────┼──────┤
+│      (col_span: 2)   │  D   │  E   │
+└──────────────────────┴──────┴──────┘
+```
+
+```yaml
+display:
+  rows: 2
+  cols: 3
+
+cells:
+  - streams: [front_door]   # A — spans 2 rows, 1 column (left side)
+    row_span: 2
+  - streams: [back_yard]    # B — top-centre
+  - streams: [driveway]     # C — top-right
+  - streams: [garage]       # D — bottom-centre
+  - streams: [side_gate]    # E — bottom-right
 ```
 
 ## Running
@@ -201,13 +307,25 @@ sudo rpi-update
 - Ensure the Pi can reach the camera network
 - Set `log_level: DEBUG` in your config, or run with `GST_DEBUG=rtspsrc:5`
 
+### Stream rotation shows a flash or grey frame
+
+viewport preloads the next stream in the background while the current stream
+keeps displaying.  The swap only happens once the new stream has produced its
+first decoded frame, so the transition should be seamless.  If cameras are slow
+to connect, increase `preload_timeout` in the `display:` section.
+
+If a camera is unreachable when a rotation is due, viewport skips it
+immediately (without interrupting the displayed stream) and tries each remaining
+stream in turn.  Only if every stream in the list is unavailable does the
+current stream stay on screen until the next rotation interval.
+
 ## Architecture
 
 ```
 src/main.py      — entry point, argument parsing, GLib main loop
 src/config.py    — YAML config loading and dataclasses
 src/pipeline.py  — shared GStreamer pipeline (compositor + kmssink)
-src/cell.py      — per-cell RTSP branch management and stream rotation
+src/cell.py      — per-cell RTSP branch management, rotation, and preloading
 ```
 
 Each cell owns an independent GStreamer element branch:
@@ -232,9 +350,18 @@ rtspsrc ─(pad-added)─► rtph264depay ─► h264parse
 The compositor scales each input to its cell dimensions via pad properties,
 so no separate `videoscale` or per-cell `capsfilter` is needed.
 
-Stream rotation and reconnection (for stalled single-URL cells) both run on
-the GLib main loop thread, calling a teardown + reconnect sequence without
-any GStreamer pad probes.
+**Stream rotation** uses a shadow-branch preloading strategy.  When the rotation
+timer fires, a second branch for the next stream is built and linked to a
+temporary `fakesink`.  While the current stream continues displaying, the shadow
+branch connects, negotiates, and decodes its first keyframe.  Once that frame
+arrives, the branches are hot-swapped on the GLib main loop: the shadow branch
+is re-linked to the compositor and the old branch is torn down.  If a stream
+never produces a frame within `preload_timeout` seconds, the shadow branch is
+discarded and the next stream in the list is tried immediately.
+
+**Single-URL cells** use a watchdog timer instead: if no decoded frame arrives
+for 30 seconds (including the case where a stream never connected), the branch
+is torn down and reconnected automatically.
 
 ## License
 
