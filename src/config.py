@@ -77,6 +77,11 @@ class CellConfig:
         if self.rotation_interval < 0:
             raise ValueError("rotation_interval must be >= 0")
         if len(self.streams) == 1:
+            if self.rotation_interval != 0:
+                log.warning(
+                    "rotation_interval=%d ignored: cell has only one stream",
+                    self.rotation_interval,
+                )
             self.rotation_interval = 0  # no rotation needed with a single stream
 
 
@@ -94,8 +99,16 @@ class AppConfig:
             )
         # Pad with blank placeholder cells if fewer than CELL_COUNT are given.
         # Blank cells show black; they have no streams and no rotation.
+        blank_count = CELL_COUNT - len(self.cells)
         while len(self.cells) < CELL_COUNT:
             self.cells.append(None)  # type: ignore[arg-type]
+        if blank_count:
+            log.debug(
+                "%d blank placeholder cell(s) added to fill %d×%d grid",
+                blank_count,
+                GRID_ROWS,
+                GRID_COLS,
+            )
 
         valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR"}
         self.log_level = self.log_level.upper()
@@ -235,6 +248,12 @@ def load_config(path: str) -> AppConfig:
                         f"and not defined in top-level 'groups:')"
                     )
 
+            log.debug(
+                "Cell %d: %d stream(s) resolved — %s",
+                i,
+                len(resolved_streams),
+                ", ".join(resolved_labels),
+            )
             cells.append(
                 CellConfig(
                     streams=resolved_streams,

@@ -31,12 +31,13 @@ from cell import Cell, detect_decoders
 
 
 def _setup_logging(level_name: str) -> None:
+    # logging.basicConfig() is a no-op after its first call, so we must set the
+    # level directly on the root logger and any handlers it already has.
     level = getattr(logging, level_name.upper(), logging.INFO)
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    root = logging.getLogger()
+    root.setLevel(level)
+    for handler in root.handlers:
+        handler.setLevel(level)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -54,9 +55,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
 
-    # Bootstrap with WARNING until the config file tells us the real level.
+    # Bootstrap with INFO until the config file tells us the real level.
+    # INFO lets startup messages (e.g. "Loaded config") through; the user-
+    # configured level is applied by _setup_logging() after the config loads.
     logging.basicConfig(
-        level=logging.WARNING,
+        level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
@@ -103,6 +106,7 @@ def main() -> int:
         cells.append(cell)
 
     for cell in cells:
+        log.debug("Cell %d: starting", cell.index)
         try:
             cell.start()
         except RuntimeError as exc:

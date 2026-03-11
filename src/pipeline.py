@@ -80,6 +80,7 @@ class ViewportPipeline:
         # Property added in GStreamer 1.20; silently skipped on 1.18.
         if hasattr(compositor.props, "ignore_inactive_pads"):
             compositor.set_property("ignore-inactive-pads", True)
+            log.debug("compositor: ignore-inactive-pads enabled")
         else:
             log.debug(
                 "compositor: ignore-inactive-pads not available (GStreamer < 1.20); "
@@ -105,6 +106,10 @@ class ViewportPipeline:
             pad.set_property("width", cw)
             pad.set_property("height", ch)
             self._compositor_pads.append(pad)
+            log.debug(
+                "Compositor pad %d: xpos=%d ypos=%d size=%dx%d",
+                idx, col * cw, row * ch, cw, ch,
+            )
 
         # --- output: capsfilter → kmssink ---
         # The framerate here is critical: without it GstVideoAggregator has no
