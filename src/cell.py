@@ -45,13 +45,15 @@ branches are hot-swapped on the GLib main loop: the shadow branch is re-linked
 to the compositor and the old branch is torn down.  The current stream is
 visible right up to the moment the new stream is ready, eliminating the gap.
 
-Single-URL cells (no rotation) use a watchdog timer to detect stalled streams
-and reconnect automatically.  A buffer pad probe on out_queue.src updates
-_last_frame_time each time a decoded frame leaves the branch; a GLib timer
-fires every _WATCH_SECS seconds and reconnects if no frame has arrived for
-_STALE_SECS seconds (including the case where the stream never produced its
-first frame).  Both the watchdog callback and the pad probe write/read a
-single float under the Python GIL, so no explicit lock is needed.
+All cells use a watchdog timer to detect stalled streams.  A buffer pad probe
+on out_queue.src updates _last_frame_time each time a decoded frame leaves
+the branch; a GLib timer fires every _WATCH_SECS seconds and acts if no
+frame has arrived for _STALE_SECS seconds (including the case where the
+stream never produced its first frame).  For single-URL cells the watchdog
+reconnects to the same stream; for multi-URL cells it forces an early
+rotation to the next stream.  Both the watchdog callback and the pad probe
+write/read a single float under the Python GIL, so no explicit lock is
+needed.
 """
 
 from __future__ import annotations
@@ -74,8 +76,8 @@ log = logging.getLogger(__name__)
 # Python reuses object ids, causing "element already exists" warnings.
 _branch_seq: int = 0
 
-# Watchdog parameters for single-URL cells.
-_STALE_SECS = 30  # seconds without a frame before reconnecting
+# Watchdog parameters (applies to all cells).
+_STALE_SECS = 30  # seconds without a frame before reconnecting / forcing rotation
 _WATCH_SECS = 10  # watchdog polling interval (seconds)
 
 
@@ -614,7 +616,12 @@ class Cell:
             )
             next_idx = (self._current_idx + 1) % len(self.cell_cfg.streams)
             self._shadow_next_idx = next_idx
-            self._rotation_attempt_start = self._current_idx
+            # Use next_idx (the first stream we are about to try) so the
+            # full-circle guard in _on_preload_timeout lets every stream —
+            # including the previously stale one — get a chance before giving
+            # up.  Setting _current_idx here would make the guard trigger as
+            # soon as the cascade returns to the stale stream, skipping it.
+            self._rotation_attempt_start = next_idx
             try:
                 self._start_preload(next_idx)
             except Exception as exc:
@@ -756,13 +763,14 @@ class Cell:
         """Streaming-thread probe: shadow branch has decoded its first frame.
 
         Schedules the hot-swap on the GLib main loop via idle_add and removes
-        itself (REMOVE = one-shot).  The _preloading flag prevents a race where
-        the probe fires again before idle_add runs (shouldn't happen since we
-        return REMOVE, but the flag is a cheap safety net).
+        itself (REMOVE = one-shot).
+
+        _preloading is intentionally left True here so that the reconnect
+        watchdog (a GLib timeout, higher priority than idle) cannot race in
+        the window between this probe and _complete_swap() being dispatched.
+        _complete_swap() clears _preloading itself on the main loop.
         """
-        if self._preloading:
-            self._preloading = False
-            GLib.idle_add(self._complete_swap)
+        GLib.idle_add(self._complete_swap)
         return Gst.PadProbeReturn.REMOVE
 
     def _complete_swap(self) -> bool:
@@ -798,6 +806,7 @@ class Cell:
             log.warning(
                 "Cell %d: _complete_swap called but shadow branch is gone", self.index
             )
+            self._preloading = False
             return False
 
         # Clear shadow state (local vars hold the references we need).
@@ -854,6 +863,7 @@ class Cell:
                     self.pipeline.remove(el)
                 shadow_fakesink.set_state(Gst.State.NULL)
                 self.pipeline.remove(shadow_fakesink)
+                self._preloading = False
                 return False
 
         # --- Step 6: Resume shadow elements. ---
@@ -900,6 +910,7 @@ class Cell:
         shadow_fakesink.set_state(Gst.State.NULL)
         self.pipeline.remove(shadow_fakesink)
 
+        self._preloading = False
         return False  # GLib.SOURCE_REMOVE — run once only
 
     def _abort_preload(self) -> None:
