@@ -190,16 +190,19 @@ class Cell:
                 self.cell_cfg.rotation_interval,
                 len(self.cell_cfg.streams),
             )
-        elif len(self.cell_cfg.streams) == 1:
-            # Single-URL cells use a watchdog to detect stalls and reconnect.
-            self._reconnect_source_id = GLib.timeout_add_seconds(
-                _WATCH_SECS, self._on_reconnect_watchdog
-            )
-            log.debug(
-                "Cell %d: reconnect watchdog active (%ds stale threshold)",
-                self.index,
-                _STALE_SECS,
-            )
+
+        # Watchdog runs for all cells: reconnects single-URL cells to the same
+        # stream, and forces an early rotation for multi-URL cells when the
+        # active stream stalls between rotation intervals.
+        self._reconnect_source_id = GLib.timeout_add_seconds(
+            _WATCH_SECS, self._on_reconnect_watchdog
+        )
+        log.debug(
+            "Cell %d: watchdog active (%ds stale threshold, polls every %ds)",
+            self.index,
+            _STALE_SECS,
+            _WATCH_SECS,
+        )
 
     def stop(self) -> None:
         """Tear down the active branch cleanly."""
@@ -554,14 +557,16 @@ class Cell:
         return Gst.PadProbeReturn.OK
 
     def _on_reconnect_watchdog(self) -> bool:
-        """GLib timer: reconnect the stream if no frames have arrived recently.
+        """GLib timer: detect stalled streams and recover.
+
+        For single-URL cells: tears down and reconnects to the same URL.
+        For multi-URL rotating cells: forces an early rotation to the next
+        stream (same logic as the rotation timer, but triggered by staleness
+        instead of by the clock).
 
         Runs on the GLib main loop thread — safe for pipeline topology changes.
         Returns True to keep the timer running, False to cancel it.
         """
-        if len(self.cell_cfg.streams) != 1:
-            return False  # rotating cell — watchdog not needed; cancel timer
-
         now = time.monotonic()
         if self._last_frame_time > 0.0:
             # At least one frame has been received; measure staleness from it.
@@ -576,21 +581,48 @@ class Cell:
         if elapsed < _STALE_SECS:
             return True  # stream is healthy; keep timer running
 
-        url = self.cell_cfg.streams[0]
-        log.warning(
-            "Cell %d: no frames for %.0f s — reconnecting to %s",
-            self.index,
-            elapsed,
-            self._stream_display(url, 0),
-        )
-        self._teardown_branch()
-        try:
-            self._connect_stream(url)
-        except Exception as exc:
-            log.error("Cell %d: reconnect failed: %s", self.index, exc)
-            # _stream_start_time was reset by _teardown_branch and will be set
-            # again by _connect_stream; next watchdog tick will try again after
-            # another _STALE_SECS of silence.
+        if len(self.cell_cfg.streams) == 1:
+            # Single-URL cell: reconnect to the same stream.
+            url = self.cell_cfg.streams[0]
+            log.warning(
+                "Cell %d: no frames for %.0f s — reconnecting to %s",
+                self.index,
+                elapsed,
+                self._stream_display(url, 0),
+            )
+            self._teardown_branch()
+            try:
+                self._connect_stream(url)
+            except Exception as exc:
+                log.error("Cell %d: reconnect failed: %s", self.index, exc)
+                # _stream_start_time was reset by _teardown_branch and will be
+                # set again by _connect_stream; next watchdog tick retries.
+        else:
+            # Multi-URL rotating cell: force an early rotation instead of
+            # reconnecting to the stale stream.
+            if self._preloading:
+                # A preload is already in progress — let it finish.
+                return True
+            url = self.cell_cfg.streams[self._current_idx]
+            log.warning(
+                "Cell %d: no frames for %.0f s — forcing early rotation "
+                "(stream %d: %s)",
+                self.index,
+                elapsed,
+                self._current_idx,
+                self._stream_display(url, self._current_idx),
+            )
+            next_idx = (self._current_idx + 1) % len(self.cell_cfg.streams)
+            self._shadow_next_idx = next_idx
+            self._rotation_attempt_start = self._current_idx
+            try:
+                self._start_preload(next_idx)
+            except Exception as exc:
+                log.error(
+                    "Cell %d: forced rotation failed to start: %s", self.index, exc
+                )
+                self._current_idx = next_idx
+                self._rotation_attempt_start = -1
 
         return True  # keep timer running
 
