@@ -1,6 +1,6 @@
 # viewport
 
-Headless RTSP multi-stream display for Raspberry Pi 4+.
+Headless RTSP multi-stream display.
 
 Displays any number of RTSP video streams in a configurable grid on a connected
 monitor.  Output goes directly to the GPU via DRM/KMS — no X11, Wayland, or
@@ -25,17 +25,19 @@ appears seamless — the current stream stays visible until the new one is ready
 
 ## Requirements
 
-- Raspberry Pi 4 (or newer) running Raspberry Pi OS (Bookworm/Bullseye) or Ubuntu
 - Python 3.9+
-- GStreamer 1.18+ with the plugins listed below
+- GStreamer 1.18+
+
+The installation instructions / script assume running on Debian or Debian-based distro (such as Raspberry Pi OS or Ubuntu)
+
+Tested on Raspberry Pi 4, but is likely to work on any Linux device with sufficient computing power
 
 ## Installation
 
 ### 1. Install system packages
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y \
+sudo apt install -y \
     python3-gi gir1.2-gstreamer-1.0 python3-gst-1.0 \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad \
@@ -82,6 +84,7 @@ describe each part of the config file.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `log_level` | `INFO` | Verbosity: `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
+| `gst_debug` | *(none)* | GStreamer debug filter string — same format as the `GST_DEBUG` env var (e.g. `"rtspsrc:4"`, `"*:2"`); overrides the env var when set |
 
 ### `display:`
 
@@ -96,6 +99,7 @@ Controls the output resolution, grid layout, and rotation behaviour.
 | `cols` | `2` | Number of grid columns |
 | `connector_id` | *(auto)* | DRM connector ID for `kmssink`; omit for auto-detect |
 | `preload_timeout` | `10` | Seconds to wait for a preloaded stream's first frame before skipping it |
+| `max_connection_age_hours` | `0` | Proactively refresh single-URL cell connections after this many hours, even if frames are still flowing; `0` disables. Recommended: `12`–`24` for 24/7 installs |
 
 > **Why `framerate` must be set:** Without it, the GStreamer compositor waits for
 > all input pads to produce a frame at the *same* timestamp before compositing.
@@ -110,8 +114,9 @@ display:
   framerate: 15
   rows: 3
   cols: 2
-  # connector_id: 42      # run `modetest -c` to list available IDs
-  # preload_timeout: 10   # increase for slow/remote cameras
+  # connector_id: 42              # run `modetest -c` to list available IDs
+  # preload_timeout: 10           # increase for slow/remote cameras
+  # max_connection_age_hours: 12  # proactive refresh for 24/7 installs
 ```
 
 ### `decoder:`
@@ -227,7 +232,21 @@ python3 /opt/viewport/main.py /etc/viewport/config.yaml
 
 ### With debug logging
 
-Set `log_level: DEBUG` in your config file, then run as above.
+Set `log_level: DEBUG` in your config file for application-level logging.
+
+To enable GStreamer element-level tracing, set `gst_debug` in your config:
+
+```yaml
+# connection / reconnect events for all RTSP sources:
+gst_debug: "rtspsrc:4"
+
+# rtspsrc verbose + all other elements at warning level:
+gst_debug: "rtspsrc:4,*:2"
+```
+
+`gst_debug` uses the same filter format as the `GST_DEBUG` environment variable
+and overrides it when both are present.  Level reference:
+`0`=none · `1`=error · `2`=warning · `3`=fixme · `4`=info · `5`=debug · `6`=log
 
 ### Specifying a DRM connector
 
@@ -305,7 +324,8 @@ sudo rpi-update
 
 - Verify the RTSP URL is reachable: `ffprobe rtsp://YOUR_URL`
 - Ensure the Pi can reach the camera network
-- Set `log_level: DEBUG` in your config, or run with `GST_DEBUG=rtspsrc:5`
+- Set `log_level: DEBUG` in your config for application-level detail
+- Set `gst_debug: "rtspsrc:4"` in your config (or `GST_DEBUG=rtspsrc:4` in the environment) for GStreamer connection tracing
 
 ### Stream rotation shows a flash or grey frame
 
@@ -361,7 +381,11 @@ discarded and the next stream in the list is tried immediately.
 
 **Single-URL cells** use a watchdog timer instead: if no decoded frame arrives
 for 30 seconds (including the case where a stream never connected), the branch
-is torn down and reconnected automatically.
+is preloaded fresh in the background and hot-swapped in — the same seamless
+mechanism used for rotation.  If `max_connection_age_hours` is set, the watchdog
+also initiates a proactive preload once the connection reaches that age, even
+while frames are still flowing.  This prevents the gradual quality degradation
+some cameras introduce on very long-lived RTSP/TCP sessions.
 
 ## License
 

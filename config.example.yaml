@@ -8,6 +8,17 @@
 # Verbosity: DEBUG | INFO | WARNING | ERROR  (default: INFO)
 log_level: INFO
 
+# GStreamer debug filter (optional).  Same format as the GST_DEBUG environment
+# variable.  When set, this overrides any GST_DEBUG value in the environment so
+# the config file is the single source of truth.
+# Level reference: 0=none  1=error  2=warning  3=fixme  4=info  5=debug  6=log
+# Examples:
+#   gst_debug: "rtspsrc:4"                  # rtspsrc element at info level
+#   gst_debug: "*:2"                        # all elements at warning level
+#   gst_debug: "rtspsrc:4,compositor:3"     # multiple elements at different levels
+# Omit (or comment out) to leave GStreamer's debug thresholds untouched.
+# gst_debug: "rtspsrc:4"
+
 # ---------------------------------------------------------------------------
 # Display settings
 # ---------------------------------------------------------------------------
@@ -25,6 +36,13 @@ display:
   # preload_timeout: 10  # Seconds to wait for a preloaded stream's first decoded
                          # frame before giving up and falling back to a direct swap.
                          # Increase for slow cameras; decrease for fast local cameras.
+  # max_connection_age_hours: 12  # Proactively refresh single-URL cell connections
+                                  # after this many hours, even if frames are still
+                                  # flowing.  Prevents gradual degradation on cameras
+                                  # that corrupt long-lived RTSP/TCP sessions.
+                                  # The refresh is seamless (shadow-branch preload +
+                                  # hot-swap); viewers see no gap.  Set to 0 (default)
+                                  # to disable.  Recommended: 12–24 for 24/7 installs.
 
 # ---------------------------------------------------------------------------
 # Decoder settings

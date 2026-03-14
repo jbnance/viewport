@@ -32,10 +32,16 @@ class DisplayConfig:
     # DRM connector ID for kmssink.  None = auto-detect (works for most setups).
     # Run `modetest -c` on the Pi to list available connector IDs.
     connector_id: Optional[int] = None
-    # Shadow-branch preload timeout.  When a rotating cell preloads the next
-    # stream in the background, it waits up to this many seconds for the first
-    # decoded frame before giving up and falling back to a direct swap.
+    # Shadow-branch preload timeout.  When a cell preloads the next stream
+    # (or refreshes a single-URL cell connection) in the background, it waits
+    # up to this many seconds for the first decoded frame before giving up.
     preload_timeout: int = 10
+    # Proactive connection refresh for single-URL cells.  After a connection
+    # has been alive for this many hours the cell preloads a fresh instance of
+    # the same stream in the background and hot-swaps to it seamlessly —
+    # preventing the gradual degradation some cameras cause on very long-lived
+    # RTSP/TCP sessions.  Set to 0 (the default) to disable.
+    max_connection_age_hours: float = 0.0
 
     def __post_init__(self) -> None:
         if self.rows < 1 or self.cols < 1:
@@ -46,6 +52,11 @@ class DisplayConfig:
             raise ValueError(
                 f"display.preload_timeout must be >= 1 second "
                 f"(got {self.preload_timeout!r})"
+            )
+        if self.max_connection_age_hours < 0:
+            raise ValueError(
+                f"display.max_connection_age_hours must be >= 0 "
+                f"(got {self.max_connection_age_hours!r})"
             )
 
     @property
@@ -122,6 +133,12 @@ class AppConfig:
     decoder: DecoderConfig
     cells: list[CellConfig]
     log_level: str = "INFO"  # DEBUG | INFO | WARNING | ERROR
+    # GStreamer debug filter string — same format as the GST_DEBUG environment
+    # variable (e.g. "rtspsrc:4", "*:2", "rtspsrc:4,compositor:3").
+    # When set this overrides any GST_DEBUG value that was present at startup.
+    # None (the default) leaves GStreamer's debug thresholds untouched.
+    # Level reference: 0=none 1=error 2=warning 3=fixme 4=info 5=debug 6=log
+    gst_debug: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.cells:
@@ -226,6 +243,7 @@ def load_config(path: str) -> AppConfig:
         cols=int(disp_raw.get("cols", 2)),
         connector_id=int(raw_connector) if raw_connector is not None else None,
         preload_timeout=int(disp_raw.get("preload_timeout", 10)),
+        max_connection_age_hours=float(disp_raw.get("max_connection_age_hours", 0.0)),
     )
 
     # Decoder
@@ -358,11 +376,13 @@ def load_config(path: str) -> AppConfig:
     except ValueError as exc:
         raise ValueError(f"Grid layout error: {exc}") from exc
 
+    raw_gst_debug = raw.get("gst_debug", None)
     cfg = AppConfig(
         display=display,
         decoder=decoder,
         cells=cells,
         log_level=str(raw.get("log_level", "INFO")),
+        gst_debug=str(raw_gst_debug) if raw_gst_debug is not None else None,
     )
     log.info(
         "Loaded config: %dx%d @ %d fps, %d×%d grid, %d cell(s)",

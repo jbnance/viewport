@@ -45,13 +45,28 @@ branches are hot-swapped on the GLib main loop: the shadow branch is re-linked
 to the compositor and the old branch is torn down.  The current stream is
 visible right up to the moment the new stream is ready, eliminating the gap.
 
-Single-URL cells (no rotation) use a watchdog timer to detect stalled streams
-and reconnect automatically.  A buffer pad probe on out_queue.src updates
+All cells use a watchdog timer.  A buffer pad probe on out_queue.src updates
 _last_frame_time each time a decoded frame leaves the branch; a GLib timer
-fires every _WATCH_SECS seconds and reconnects if no frame has arrived for
-_STALE_SECS seconds (including the case where the stream never produced its
-first frame).  Both the watchdog callback and the pad probe write/read a
-single float under the Python GIL, so no explicit lock is needed.
+fires every _WATCH_SECS seconds and responds to two conditions:
+
+  Stale stream (no frames for _STALE_SECS seconds):
+    - Single-URL cells: preload a fresh instance of the same URL in the
+      background and hot-swap to it once the first decoded frame arrives
+      (falls back to a direct teardown+reconnect only if the preload setup
+      itself fails).
+    - Multi-URL cells: force an early rotation to the next stream via the
+      same shadow-branch preload mechanism used by the rotation timer.
+
+  Aged-out connection (single-URL cells only, opt-in):
+    If max_connection_age_hours > 0 and the current branch has been live
+    for that many hours, the watchdog initiates a proactive preload of the
+    same URL and hot-swaps to the fresh connection seamlessly — preventing
+    the gradual quality degradation some cameras cause on very long-lived
+    RTSP/TCP sessions.  Multi-URL cells are unaffected because their
+    rotation timer naturally recycles connections on every rotation cycle.
+
+Both the watchdog callback and the pad probe write/read a single float under
+the Python GIL, so no explicit lock is needed.
 """
 
 from __future__ import annotations
@@ -74,8 +89,8 @@ log = logging.getLogger(__name__)
 # Python reuses object ids, causing "element already exists" warnings.
 _branch_seq: int = 0
 
-# Watchdog parameters for single-URL cells.
-_STALE_SECS = 30  # seconds without a frame before reconnecting
+# Watchdog parameters (applies to all cells).
+_STALE_SECS = 30  # seconds without a frame before reconnecting / forcing rotation
 _WATCH_SECS = 10  # watchdog polling interval (seconds)
 
 
@@ -129,6 +144,7 @@ class Cell:
         pipeline: Gst.Pipeline,
         compositor_pad: Gst.Pad,
         preload_timeout: int = 10,
+        max_connection_age_hours: float = 0.0,
     ) -> None:
         self.index = index
         self.cell_cfg = cell_cfg
@@ -150,18 +166,19 @@ class Cell:
         self._last_frame_time: float = 0.0  # 0.0 = no frame received yet
         self._stream_start_time: float = 0.0  # set when _connect_stream runs
 
-        # Shadow branch state — used during preload-based rotation.
+        # Shadow branch state — used during preload-based rotation and
+        # single-URL cell reconnects / proactive refreshes.
         # _shadow_branch holds the not-yet-active branch being preloaded;
         # _shadow_fakesink is the temporary sink that discards its output;
         # _shadow_aux_elements holds any non-video fakesinks for the shadow rtspsrc.
-        # _preloading is True from _start_preload() until the first shadow frame
-        # arrives or the timeout fires; it gates the idle_add in the probe so
-        # the swap is only scheduled once.
-        # _rotation_attempt_start records _current_idx at the beginning of each
-        # rotation timer tick.  When a preload fails, _on_preload_timeout()
-        # immediately tries the next stream; _rotation_attempt_start lets it
-        # detect when it has gone all the way around the list without success
-        # and should stop rather than loop forever.  -1 = not in a rotation cycle.
+        # _preloading is True from _start_preload() until _complete_swap() or
+        # _abort_preload() runs on the main loop; it prevents the watchdog and
+        # rotation timer from starting a second preload while one is in flight.
+        # _rotation_attempt_start records the first index tried in a preload
+        # cascade.  When a preload fails, _on_preload_timeout() immediately
+        # tries the next stream; _rotation_attempt_start lets it detect when
+        # it has gone all the way around the list without success and should
+        # stop rather than loop forever.  -1 = not in a rotation cycle.
         self._shadow_branch: list[Gst.Element] = []
         self._shadow_fakesink: Optional[Gst.Element] = None
         self._shadow_aux_elements: list[Gst.Element] = []
@@ -170,6 +187,9 @@ class Cell:
         self._preload_timeout_id: Optional[int] = None
         self._preload_timeout: int = preload_timeout
         self._rotation_attempt_start: int = -1
+        # Maximum age (in seconds) before a single-URL cell's connection is
+        # proactively refreshed even while healthy.  0 = disabled.
+        self._max_connection_age_secs: float = max_connection_age_hours * 3600
 
     # ------------------------------------------------------------------
     # Public API
@@ -190,16 +210,19 @@ class Cell:
                 self.cell_cfg.rotation_interval,
                 len(self.cell_cfg.streams),
             )
-        elif len(self.cell_cfg.streams) == 1:
-            # Single-URL cells use a watchdog to detect stalls and reconnect.
-            self._reconnect_source_id = GLib.timeout_add_seconds(
-                _WATCH_SECS, self._on_reconnect_watchdog
-            )
-            log.debug(
-                "Cell %d: reconnect watchdog active (%ds stale threshold)",
-                self.index,
-                _STALE_SECS,
-            )
+
+        # Watchdog runs for all cells: reconnects single-URL cells to the same
+        # stream, and forces an early rotation for multi-URL cells when the
+        # active stream stalls between rotation intervals.
+        self._reconnect_source_id = GLib.timeout_add_seconds(
+            _WATCH_SECS, self._on_reconnect_watchdog
+        )
+        log.debug(
+            "Cell %d: watchdog active (%ds stale threshold, polls every %ds)",
+            self.index,
+            _STALE_SECS,
+            _WATCH_SECS,
+        )
 
     def stop(self) -> None:
         """Tear down the active branch cleanly."""
@@ -554,14 +577,23 @@ class Cell:
         return Gst.PadProbeReturn.OK
 
     def _on_reconnect_watchdog(self) -> bool:
-        """GLib timer: reconnect the stream if no frames have arrived recently.
+        """GLib timer: detect stalled or aged-out streams and recover.
+
+        Single-URL cells:
+          1. Proactive refresh — if max_connection_age_hours > 0 and the
+             connection is old enough, preload a fresh instance of the same
+             stream and hot-swap to it seamlessly (avoids visible gaps).
+          2. Stale reconnect — if no frames have arrived for _STALE_SECS,
+             preload the same stream to reconnect while showing the last
+             available frame; falls back to a direct teardown+reconnect only
+             if the preload setup itself raises.
+
+        Multi-URL rotating cells: if no frames for _STALE_SECS, force an
+        early rotation to the next stream via preloading.
 
         Runs on the GLib main loop thread — safe for pipeline topology changes.
         Returns True to keep the timer running, False to cancel it.
         """
-        if len(self.cell_cfg.streams) != 1:
-            return False  # rotating cell — watchdog not needed; cancel timer
-
         now = time.monotonic()
         if self._last_frame_time > 0.0:
             # At least one frame has been received; measure staleness from it.
@@ -573,24 +605,114 @@ class Cell:
             # _connect_stream hasn't run yet (shouldn't normally happen).
             return True
 
-        if elapsed < _STALE_SECS:
-            return True  # stream is healthy; keep timer running
+        if len(self.cell_cfg.streams) == 1:
+            # ------------------------------------------------------------------
+            # Single-URL cell
+            # ------------------------------------------------------------------
 
-        url = self.cell_cfg.streams[0]
-        log.warning(
-            "Cell %d: no frames for %.0f s — reconnecting to %s",
-            self.index,
-            elapsed,
-            self._stream_display(url, 0),
-        )
-        self._teardown_branch()
-        try:
-            self._connect_stream(url)
-        except Exception as exc:
-            log.error("Cell %d: reconnect failed: %s", self.index, exc)
-            # _stream_start_time was reset by _teardown_branch and will be set
-            # again by _connect_stream; next watchdog tick will try again after
-            # another _STALE_SECS of silence.
+            # 1. Proactive connection refresh.
+            #    Even if frames are flowing normally, replace a connection that
+            #    has been alive longer than _max_connection_age_secs to prevent
+            #    the gradual degradation some cameras cause on very long-lived
+            #    RTSP/TCP sessions.  Advance _stream_start_time now so a failed
+            #    preload doesn't immediately re-trigger; _complete_swap() will
+            #    reset it again when the fresh branch takes over.
+            if (
+                self._max_connection_age_secs > 0
+                and self._stream_start_time > 0.0
+                and not self._preloading
+                and (now - self._stream_start_time) >= self._max_connection_age_secs
+            ):
+                age_h = (now - self._stream_start_time) / 3600
+                log.info(
+                    "Cell %d: proactive refresh — connection is %.1f h old "
+                    "(limit %.1f h)",
+                    self.index,
+                    age_h,
+                    self._max_connection_age_secs / 3600,
+                )
+                self._stream_start_time = now  # defer retry on preload failure
+                self._shadow_next_idx = 0
+                self._rotation_attempt_start = 0
+                try:
+                    self._start_preload(0)
+                except Exception as exc:
+                    log.error(
+                        "Cell %d: proactive refresh preload failed to start: %s",
+                        self.index,
+                        exc,
+                    )
+                return True
+
+            # 2. Stale-stream reconnect.
+            if elapsed < _STALE_SECS:
+                return True  # stream is healthy; keep timer running
+
+            if self._preloading:
+                # Preload already in progress — let it finish.
+                return True
+
+            url = self.cell_cfg.streams[0]
+            log.warning(
+                "Cell %d: no frames for %.0f s — reconnecting to %s",
+                self.index,
+                elapsed,
+                self._stream_display(url, 0),
+            )
+            self._shadow_next_idx = 0
+            self._rotation_attempt_start = 0
+            try:
+                self._start_preload(0)
+            except Exception as exc:
+                log.error(
+                    "Cell %d: reconnect preload failed to start (%s) — "
+                    "falling back to direct reconnect",
+                    self.index,
+                    exc,
+                )
+                # Last resort: tear down and reconnect without a shadow branch.
+                self._teardown_branch()
+                try:
+                    self._connect_stream(url)
+                except Exception as exc2:
+                    log.error("Cell %d: direct reconnect failed: %s", self.index, exc2)
+
+        else:
+            # ------------------------------------------------------------------
+            # Multi-URL rotating cell: force an early rotation to the next stream.
+            # ------------------------------------------------------------------
+            if elapsed < _STALE_SECS:
+                return True  # stream is healthy; keep timer running
+
+            if self._preloading:
+                # A preload is already in progress — let it finish.
+                return True
+
+            url = self.cell_cfg.streams[self._current_idx]
+            log.warning(
+                "Cell %d: no frames for %.0f s — forcing early rotation "
+                "(stream %d: %s)",
+                self.index,
+                elapsed,
+                self._current_idx,
+                self._stream_display(url, self._current_idx),
+            )
+            next_idx = (self._current_idx + 1) % len(self.cell_cfg.streams)
+            self._shadow_next_idx = next_idx
+            # Use next_idx (the first stream we are about to try) so the
+            # full-circle guard in _on_preload_timeout lets every stream —
+            # including the previously stale one — get a chance before giving
+            # up.  Setting _current_idx here would make the guard trigger as
+            # soon as the cascade returns to the stale stream, skipping it.
+            self._rotation_attempt_start = next_idx
+            try:
+                self._start_preload(next_idx)
+            except Exception as exc:
+                log.error(
+                    "Cell %d: forced rotation failed to start: %s", self.index, exc
+                )
+                self._current_idx = next_idx
+                self._rotation_attempt_start = -1
 
         return True  # keep timer running
 
@@ -724,13 +846,14 @@ class Cell:
         """Streaming-thread probe: shadow branch has decoded its first frame.
 
         Schedules the hot-swap on the GLib main loop via idle_add and removes
-        itself (REMOVE = one-shot).  The _preloading flag prevents a race where
-        the probe fires again before idle_add runs (shouldn't happen since we
-        return REMOVE, but the flag is a cheap safety net).
+        itself (REMOVE = one-shot).
+
+        _preloading is intentionally left True here so that the reconnect
+        watchdog (a GLib timeout, higher priority than idle) cannot race in
+        the window between this probe and _complete_swap() being dispatched.
+        _complete_swap() clears _preloading itself on the main loop.
         """
-        if self._preloading:
-            self._preloading = False
-            GLib.idle_add(self._complete_swap)
+        GLib.idle_add(self._complete_swap)
         return Gst.PadProbeReturn.REMOVE
 
     def _complete_swap(self) -> bool:
@@ -766,6 +889,7 @@ class Cell:
             log.warning(
                 "Cell %d: _complete_swap called but shadow branch is gone", self.index
             )
+            self._preloading = False
             return False
 
         # Clear shadow state (local vars hold the references we need).
@@ -822,6 +946,7 @@ class Cell:
                     self.pipeline.remove(el)
                 shadow_fakesink.set_state(Gst.State.NULL)
                 self.pipeline.remove(shadow_fakesink)
+                self._preloading = False
                 return False
 
         # --- Step 6: Resume shadow elements. ---
@@ -868,6 +993,7 @@ class Cell:
         shadow_fakesink.set_state(Gst.State.NULL)
         self.pipeline.remove(shadow_fakesink)
 
+        self._preloading = False
         return False  # GLib.SOURCE_REMOVE — run once only
 
     def _abort_preload(self) -> None:
