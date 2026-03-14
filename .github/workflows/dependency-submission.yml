@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write   # required by the Dependency Submission API
+  id-token: write   # required by component-detection
 
 jobs:
   submit:
@@ -17,18 +18,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install OS libraries required by PyGObject
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y \
-            libcairo2-dev \
-            libgirepository1.0-dev \
-            pkg-config \
-            python3-dev
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-
       - name: Submit Python dependencies
-        uses: advanced-security/python-dependency-submission-action@v2
+        uses: advanced-security/component-detection-dependency-submission-action@v0.1.1
+        with:
+          # Pip and SimplePip are off by default and must be explicitly enabled.
+          detectorArgs: Pip=EnableIfDefaultOff,SimplePip=EnableIfDefaultOff
