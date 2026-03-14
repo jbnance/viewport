@@ -101,6 +101,7 @@ def main() -> int:
             pipeline=vp.pipeline,
             compositor_pad=vp.get_compositor_pad(i),
             preload_timeout=config.display.preload_timeout,
+            max_connection_age_hours=config.display.max_connection_age_hours,
         )
         cells.append(cell)
 

@@ -25,6 +25,13 @@ display:
   # preload_timeout: 10  # Seconds to wait for a preloaded stream's first decoded
                          # frame before giving up and falling back to a direct swap.
                          # Increase for slow cameras; decrease for fast local cameras.
+  # max_connection_age_hours: 12  # Proactively refresh single-URL cell connections
+                                  # after this many hours, even if frames are still
+                                  # flowing.  Prevents gradual degradation on cameras
+                                  # that corrupt long-lived RTSP/TCP sessions.
+                                  # The refresh is seamless (shadow-branch preload +
+                                  # hot-swap); viewers see no gap.  Set to 0 (default)
+                                  # to disable.  Recommended: 12–24 for 24/7 installs.
 
 # ---------------------------------------------------------------------------
 # Decoder settings
