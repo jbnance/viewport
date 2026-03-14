@@ -36,14 +36,18 @@ Tested on Raspberry Pi 4, but is likely to work on any Linux device with suffici
 
 ### 1. Install system packages
 
+You may not need all of these gstreamer plugins - it depends on your source streams.
+
 ```bash
 sudo apt install -y \
-    python3-gi gir1.2-gstreamer-1.0 python3-gst-1.0 \
-    gstreamer1.0-plugins-good \
-    gstreamer1.0-plugins-bad \
-    gstreamer1.0-plugins-ugly \
+    gir1.2-gstreamer-1.0 \
     gstreamer1.0-libav \
+    gstreamer1.0-plugins-bad \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-ugly \
     gstreamer1.0-tools \
+    python3-gi \
+    python3-gst-1.0 \
     python3-yaml
 ```
 
