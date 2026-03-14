@@ -79,6 +79,15 @@ def main() -> int:
     _setup_logging(config.log_level)
     log = logging.getLogger("main")
 
+    # Apply GStreamer debug filter if specified in config.  This is equivalent
+    # to setting GST_DEBUG before launch but controlled from the config file.
+    # reset=True clears any threshold previously set by the GST_DEBUG env var
+    # so the config is the single source of truth when gst_debug is present.
+    if config.gst_debug:
+        Gst.debug_set_active(True)
+        Gst.debug_set_threshold_from_string(config.gst_debug, True)
+        log.debug("GStreamer debug filter applied: %s", config.gst_debug)
+
     # Probe the GStreamer registry once to pick hardware vs. software decoders.
     # This runs a single registry query per codec instead of repeating it on
     # every stream connection, rotation, and reconnect across all 6 cells.

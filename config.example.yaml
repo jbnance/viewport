@@ -8,6 +8,17 @@
 # Verbosity: DEBUG | INFO | WARNING | ERROR  (default: INFO)
 log_level: INFO
 
+# GStreamer debug filter (optional).  Same format as the GST_DEBUG environment
+# variable.  When set, this overrides any GST_DEBUG value in the environment so
+# the config file is the single source of truth.
+# Level reference: 0=none  1=error  2=warning  3=fixme  4=info  5=debug  6=log
+# Examples:
+#   gst_debug: "rtspsrc:4"                  # rtspsrc element at info level
+#   gst_debug: "*:2"                        # all elements at warning level
+#   gst_debug: "rtspsrc:4,compositor:3"     # multiple elements at different levels
+# Omit (or comment out) to leave GStreamer's debug thresholds untouched.
+# gst_debug: "rtspsrc:4"
+
 # ---------------------------------------------------------------------------
 # Display settings
 # ---------------------------------------------------------------------------

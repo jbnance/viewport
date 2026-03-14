@@ -133,6 +133,12 @@ class AppConfig:
     decoder: DecoderConfig
     cells: list[CellConfig]
     log_level: str = "INFO"  # DEBUG | INFO | WARNING | ERROR
+    # GStreamer debug filter string — same format as the GST_DEBUG environment
+    # variable (e.g. "rtspsrc:4", "*:2", "rtspsrc:4,compositor:3").
+    # When set this overrides any GST_DEBUG value that was present at startup.
+    # None (the default) leaves GStreamer's debug thresholds untouched.
+    # Level reference: 0=none 1=error 2=warning 3=fixme 4=info 5=debug 6=log
+    gst_debug: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.cells:
@@ -370,11 +376,13 @@ def load_config(path: str) -> AppConfig:
     except ValueError as exc:
         raise ValueError(f"Grid layout error: {exc}") from exc
 
+    raw_gst_debug = raw.get("gst_debug", None)
     cfg = AppConfig(
         display=display,
         decoder=decoder,
         cells=cells,
         log_level=str(raw.get("log_level", "INFO")),
+        gst_debug=str(raw_gst_debug) if raw_gst_debug is not None else None,
     )
     log.info(
         "Loaded config: %dx%d @ %d fps, %d×%d grid, %d cell(s)",
