@@ -28,7 +28,7 @@ appears seamless — the current stream stays visible until the new one is ready
 - Python 3.9+
 - GStreamer 1.18+
 
-The installation instructions / script assume running on Debian or Debian-based distro (such as Raspberry Pi OS or Ubuntu)
+These installation instructions assume a Debian-based distribution (Raspberry Pi OS, Ubuntu, or similar).
 
 Tested on Raspberry Pi 4, but is likely to work on any Linux device with sufficient computing power
 
@@ -47,31 +47,63 @@ sudo apt install -y \
     python3-yaml
 ```
 
-### 2. Add your user to the `video` group
+### 2. Create a dedicated service user
 
-Direct KMS/DRM access requires membership in the `video` group:
+Create an unprivileged system account to run the service.  Adding it to the
+`video` group grants the DRM/KMS access that `kmssink` requires.
+
+> **Note:** On some systems `/dev/dri/renderD128` is owned by the `render`
+> group rather than `video`.  You may omit `-G render` if not required for
+> your setup.
 
 ```bash
-sudo usermod -aG video $USER
-# Log out and back in, or run: newgrp video
+sudo useradd -c 'Viewport Runner' -d / -g video -G render -M -N -s /usr/sbin/nologin viewport
 ```
 
-### 3. Run the install script
+### 3. Copy application files
 
 ```bash
-sudo bash install.sh
+sudo mkdir -p /opt/viewport
+sudo cp src/main.py src/config.py src/pipeline.py src/cell.py /opt/viewport/
+sudo chmod 755 /opt/viewport/main.py
 ```
 
-The script installs system packages, adds your user to the `video` group,
-copies the application files to `/opt/viewport`, places an example config at
-`/etc/viewport/config.yaml`, installs the systemd unit, and enables the service.
-
-Run `bash install.sh --help` for available options (custom user, paths, etc.).
-
-### 4. Edit your configuration
+### 4. Create the configuration file
 
 ```bash
-sudo nano /etc/viewport/config.yaml   # add your RTSP stream URLs
+sudo mkdir -p /etc/viewport
+sudo cp config.example.yaml /etc/viewport/config.yaml
+```
+
+Edit the configuration to add your RTSP stream URLs:
+
+```bash
+sudo nano /etc/viewport/config.yaml
+```
+
+### 5. Install the systemd unit
+
+```bash
+sudo cp deploy/viewport.service /etc/systemd/system/
+```
+
+Open the unit file and confirm the `User=` value matches the service account
+you created in step 2 (the default in the file is `viewport`):
+
+```bash
+sudo nano /etc/systemd/system/viewport.service
+```
+
+### 6. Enable and start the service
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable viewport
+sudo systemctl start viewport
+
+# Check status / logs
+sudo systemctl status viewport
+sudo journalctl -u viewport -f
 ```
 
 ## Configuration
@@ -264,17 +296,13 @@ display:
   connector_id: 42   # replace with the ID shown by modetest -c
 ```
 
-### As a systemd service (autostart at boot)
+### Managing the systemd service
 
 ```bash
-sudo cp deploy/viewport.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable viewport
-sudo systemctl start viewport
-
-# Check status / logs
-sudo systemctl status viewport
-sudo journalctl -u viewport -f
+sudo systemctl status viewport          # check current state
+sudo systemctl restart viewport         # apply config changes
+sudo systemctl stop viewport            # stop the service
+sudo journalctl -u viewport -f          # follow live logs
 ```
 
 ## Troubleshooting
@@ -305,19 +333,6 @@ gst-inspect-1.0 kmssink         # DRM/KMS output
 gst-inspect-1.0 v4l2slh264dec   # hardware H.264 decoder (stateless rpivid)
 gst-inspect-1.0 v4l2slh265dec   # hardware H.265 decoder (stateless rpivid)
 gst-inspect-1.0 compositor      # multi-stream compositor
-```
-
-### Hardware decoder not found
-
-viewport uses the stateless V4L2 decoder (`v4l2slh264dec` / `v4l2slh265dec`),
-which requires the **rpivid** kernel driver.  If it is unavailable, the
-application automatically falls back to software decoding (`avdec_h264`); you
-can also opt out explicitly with `prefer_hardware: false` in your config.
-
-Ensure your firmware is up to date:
-
-```bash
-sudo rpi-update
 ```
 
 ### Black cells / stream not connecting
