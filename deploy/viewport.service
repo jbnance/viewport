@@ -21,9 +21,6 @@ ExecStart=/usr/bin/python3 /opt/viewport/main.py /etc/viewport/config.yaml
 Restart=on-failure
 RestartSec=5
 
-# Ensure the process has access to the GPU device
-DeviceAllow=/dev/dri rw
-DeviceAllow=/dev/video* rw
-
 [Install]
 WantedBy=multi-user.target
+
