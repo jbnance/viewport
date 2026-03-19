@@ -44,9 +44,22 @@ class DisplayConfig:
     max_connection_age_hours: float = 0.0
 
     def __post_init__(self) -> None:
+        if self.width < 1 or self.height < 1:
+            raise ValueError(
+                f"display width and height must each be >= 1, "
+                f"got {self.width}×{self.height}"
+            )
+        if self.framerate < 1:
+            raise ValueError(
+                f"display.framerate must be >= 1 (got {self.framerate!r})"
+            )
         if self.rows < 1 or self.cols < 1:
             raise ValueError(
                 f"display rows and cols must each be >= 1, got {self.rows}×{self.cols}"
+            )
+        if self.connector_id is not None and self.connector_id < 0:
+            raise ValueError(
+                f"display.connector_id must be >= 0 (got {self.connector_id!r})"
             )
         if self.preload_timeout < 1:
             raise ValueError(
