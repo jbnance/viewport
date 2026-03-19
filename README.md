@@ -48,6 +48,7 @@ sudo apt install -y \
     gstreamer1.0-tools \
     python3-gi \
     python3-gst-1.0 \
+    python3-systemd \
     python3-yaml
 ```
 
