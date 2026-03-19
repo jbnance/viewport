@@ -27,7 +27,7 @@ display:
   height: 1080    # output resolution height (must match your display)
   framerate: 15   # compositor output framerate (fps).  Set to match your cameras'
                   # stream framerate (UniFi Protect high-quality = 15 or 20 fps).
-                  # This MUST be set: without it the compositor waits for all 6
+                  # This MUST be set: without it the compositor waits for all
                   # RTSP clocks to agree on a timestamp, producing <1 fps output.
   rows: 3         # grid rows    (default: 3)
   cols: 2         # grid columns (default: 2)
