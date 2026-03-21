@@ -121,6 +121,7 @@ def main() -> int:
             compositor_pad=vp.get_compositor_pad(i),
             preload_timeout=config.display.preload_timeout,
             max_connection_age_hours=config.display.max_connection_age_hours,
+            tcp_timeout=config.display.tcp_timeout,
         )
         cells.append(cell)
 

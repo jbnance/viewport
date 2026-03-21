@@ -36,6 +36,9 @@ display:
   # preload_timeout: 10  # Seconds to wait for a preloaded stream's first decoded
                          # frame before giving up and falling back to a direct swap.
                          # Increase for slow cameras; decrease for fast local cameras.
+  # tcp_timeout: 5  # TCP timeout (seconds) for RTSP connections.  Bounds how
+                     # long rtspsrc blocks during connection setup and teardown
+                     # when a camera is unreachable.  Raise for slow/WAN cameras.
   # max_connection_age_hours: 12  # Proactively refresh single-URL cell connections
                                   # after this many hours, even if frames are still
                                   # flowing.  Prevents gradual degradation on cameras

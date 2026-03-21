@@ -42,6 +42,11 @@ class DisplayConfig:
     # preventing the gradual degradation some cameras cause on very long-lived
     # RTSP/TCP sessions.  Set to 0 (the default) to disable.
     max_connection_age_hours: float = 0.0
+    # TCP timeout for RTSP connections (seconds).  Bounds how long rtspsrc
+    # blocks during connection attempts and teardown when a camera is
+    # unreachable.  Lower values detect failures faster; raise if cameras
+    # are on a slow or lossy network.
+    tcp_timeout: int = 5
 
     def __post_init__(self) -> None:
         if self.width < 1 or self.height < 1:
@@ -70,6 +75,11 @@ class DisplayConfig:
             raise ValueError(
                 f"display.max_connection_age_hours must be >= 0 "
                 f"(got {self.max_connection_age_hours!r})"
+            )
+        if self.tcp_timeout < 1:
+            raise ValueError(
+                f"display.tcp_timeout must be >= 1 second "
+                f"(got {self.tcp_timeout!r})"
             )
 
     @property
@@ -257,6 +267,7 @@ def load_config(path: str) -> AppConfig:
         connector_id=int(raw_connector) if raw_connector is not None else None,
         preload_timeout=int(disp_raw.get("preload_timeout", 10)),
         max_connection_age_hours=float(disp_raw.get("max_connection_age_hours", 0.0)),
+        tcp_timeout=int(disp_raw.get("tcp_timeout", 5)),
     )
 
     # Decoder
