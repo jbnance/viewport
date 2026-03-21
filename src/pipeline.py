@@ -179,6 +179,14 @@ class ViewportPipeline:
             warn, debug = message.parse_warning()
             src_name = message.src.get_name() if message.src else "unknown"
             log.warning("GStreamer warning from %s: %s", src_name, warn.message)
+        elif t == Gst.MessageType.CLOCK_LOST:
+            # The pipeline's clock provider disappeared (e.g. an rtspsrc element
+            # was torn down during cell rotation).  Pause → play forces the
+            # pipeline to select a new clock provider immediately rather than
+            # silently accumulating frame queues against a dead clock.
+            log.warning("Pipeline clock lost — recalculating")
+            self.pipeline.set_state(Gst.State.PAUSED)
+            self.pipeline.set_state(Gst.State.PLAYING)
         elif t == Gst.MessageType.EOS:
             log.info("Pipeline received EOS — stopping")
             if self._loop:

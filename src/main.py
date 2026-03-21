@@ -120,11 +120,22 @@ def main() -> int:
             cell.start()
         except RuntimeError as exc:
             log.error("Cell %d failed to start: %s", cell.index, exc)
+            for started in cells:
+                started.stop()
             return 1
 
     # GLib main loop
     loop = GLib.MainLoop()
     vp.attach_bus_handler(loop)
+
+    # Handle Ctrl-C and SIGTERM gracefully.  Registered before play() so the
+    # handlers are active during the PLAYING state transition.
+    def _shutdown(signum, frame):  # type: ignore[no-untyped-def]
+        log.info("Shutting down (signal %d)…", signum)
+        loop.quit()
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
 
     # Start playing
     try:
@@ -132,14 +143,6 @@ def main() -> int:
     except RuntimeError as exc:
         log.error("Failed to start pipeline: %s", exc)
         return 1
-
-    # Handle Ctrl-C and SIGTERM gracefully
-    def _shutdown(signum, frame):  # type: ignore[no-untyped-def]
-        log.info("Shutting down (signal %d)…", signum)
-        loop.quit()
-
-    signal.signal(signal.SIGINT, _shutdown)
-    signal.signal(signal.SIGTERM, _shutdown)
 
     log.info(
         "viewport running — %dx%d @ %d fps, %d cell(s). Press Ctrl-C to stop.",
