@@ -27,7 +27,7 @@ display:
   height: 1080    # output resolution height (must match your display)
   framerate: 15   # compositor output framerate (fps).  Set to match your cameras'
                   # stream framerate (UniFi Protect high-quality = 15 or 20 fps).
-                  # This MUST be set: without it the compositor waits for all 6
+                  # This MUST be set: without it the compositor waits for all
                   # RTSP clocks to agree on a timestamp, producing <1 fps output.
   rows: 3         # grid rows    (default: 3)
   cols: 2         # grid columns (default: 2)
@@ -36,6 +36,9 @@ display:
   # preload_timeout: 10  # Seconds to wait for a preloaded stream's first decoded
                          # frame before giving up and falling back to a direct swap.
                          # Increase for slow cameras; decrease for fast local cameras.
+  # tcp_timeout: 5  # TCP timeout (seconds) for RTSP connections.  Bounds how
+                     # long rtspsrc blocks during connection setup and teardown
+                     # when a camera is unreachable.  Raise for slow/WAN cameras.
   # max_connection_age_hours: 12  # Proactively refresh single-URL cell connections
                                   # after this many hours, even if frames are still
                                   # flowing.  Prevents gradual degradation on cameras

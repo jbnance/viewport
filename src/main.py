@@ -55,14 +55,24 @@ def _parse_args() -> argparse.Namespace:
 def main() -> int:
     args = _parse_args()
 
-    # Bootstrap with INFO until the config file tells us the real level.
-    # INFO lets startup messages (e.g. "Loaded config") through; the user-
-    # configured level is applied by _setup_logging() after the config loads.
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-    )
+    # Bootstrap logging with INFO until the config file tells us the real level.
+    # When python3-systemd is available, use JournalHandler which calls the
+    # native sd_journal_send API directly.  This avoids the stderr fd
+    # invalidation problem that silently kills all log delivery after journald
+    # rotates its files on long-running services.  Fall back to StreamHandler
+    # for interactive use or systems without the package.
+    try:
+        from systemd.journal import JournalHandler
+        _journal_handler = JournalHandler(SYSLOG_IDENTIFIER="viewport")
+        _journal_handler.setLevel(logging.INFO)
+        logging.root.addHandler(_journal_handler)
+        logging.root.setLevel(logging.INFO)
+    except ImportError:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        )
     log = logging.getLogger("main")
 
     # GStreamer init — must happen before any Gst calls
@@ -111,6 +121,7 @@ def main() -> int:
             compositor_pad=vp.get_compositor_pad(i),
             preload_timeout=config.display.preload_timeout,
             max_connection_age_hours=config.display.max_connection_age_hours,
+            tcp_timeout=config.display.tcp_timeout,
         )
         cells.append(cell)
 

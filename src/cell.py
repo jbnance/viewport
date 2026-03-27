@@ -72,6 +72,8 @@ the Python GIL, so no explicit lock is needed.
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 import time
 from typing import Optional
 
@@ -92,6 +94,37 @@ _branch_seq: int = 0
 # Watchdog parameters (applies to all cells).
 _STALE_SECS = 30  # seconds without a frame before reconnecting / forcing rotation
 _WATCH_SECS = 10  # watchdog polling interval (seconds)
+
+# ---------------------------------------------------------------------------
+# Background teardown worker
+# ---------------------------------------------------------------------------
+# A single daemon thread NULLs orphaned GStreamer elements.  The caller
+# removes elements from the pipeline on the main loop (fast, no network I/O)
+# and enqueues them here.  set_state(NULL) on a standalone rtspsrc can still
+# block for seconds (TCP teardown), but since the element is no longer in the
+# pipeline it cannot contend with the compositor or affect frame delivery.
+_teardown_queue: queue.Queue[tuple[list[Gst.Element], int]] = queue.Queue()
+
+
+def _teardown_worker() -> None:
+    """Drain the teardown queue forever (daemon thread — exits with process)."""
+    while True:
+        elements, cell_idx = _teardown_queue.get()
+        try:
+            for el in elements:
+                el.set_state(Gst.State.NULL)
+            log.debug(
+                "Cell %d: background teardown complete (%d elements)",
+                cell_idx,
+                len(elements),
+            )
+        except Exception:
+            log.exception("Cell %d: background teardown error", cell_idx)
+        finally:
+            _teardown_queue.task_done()
+
+
+threading.Thread(target=_teardown_worker, daemon=True, name="teardown").start()
 
 
 def _next_suffix(cell_idx: int) -> str:
@@ -145,6 +178,7 @@ class Cell:
         compositor_pad: Gst.Pad,
         preload_timeout: int = 10,
         max_connection_age_hours: float = 0.0,
+        tcp_timeout: int = 5,
     ) -> None:
         self.index = index
         self.cell_cfg = cell_cfg
@@ -190,6 +224,8 @@ class Cell:
         # Maximum age (in seconds) before a single-URL cell's connection is
         # proactively refreshed even while healthy.  0 = disabled.
         self._max_connection_age_secs: float = max_connection_age_hours * 3600
+        # TCP timeout for rtspsrc in microseconds (rtspsrc's native unit).
+        self._tcp_timeout_us: int = tcp_timeout * 1_000_000
 
     # ------------------------------------------------------------------
     # Public API
@@ -236,10 +272,30 @@ class Cell:
         if self._preloading or self._shadow_branch:
             self._abort_preload()
         self._teardown_branch()
+        # Wait for all enqueued teardowns to finish so elements are fully
+        # released before the caller stops the pipeline.
+        _teardown_queue.join()
 
     # ------------------------------------------------------------------
     # Branch management
     # ------------------------------------------------------------------
+
+    def _teardown_elements_async(self, elements: list[Gst.Element]) -> None:
+        """Remove elements from the pipeline, then NULL them in the background.
+
+        The caller MUST unlink the elements from any live pads (e.g. the
+        compositor) before calling this.
+
+        pipeline.remove() runs here on the main loop (fast, no network I/O)
+        and also unsets each element's bus — so they can no longer post
+        messages.  The background thread then calls set_state(NULL) on the
+        now-standalone elements without contending with the pipeline.
+        """
+        if not elements:
+            return
+        for el in elements:
+            self.pipeline.remove(el)
+        _teardown_queue.put((elements, self.index))
 
     def _connect_stream(self, url: str) -> None:
         """Build a new branch for *url*, add it to the pipeline, and sync state."""
@@ -272,7 +328,12 @@ class Cell:
         self._last_frame_time = 0.0
 
     def _teardown_branch(self) -> None:
-        """Unlink, stop, and remove the current branch elements from the pipeline."""
+        """Unlink, stop, and remove the current branch elements from the pipeline.
+
+        The actual set_state(NULL) + pipeline.remove() is deferred to the
+        background teardown thread so that a hung rtspsrc (TCP timeout on an
+        unreachable camera) cannot block the GLib main loop.
+        """
         branch = self._branch
         self._branch = []
 
@@ -287,28 +348,18 @@ class Cell:
         if src_pad and src_pad.is_linked():
             src_pad.unlink(self.compositor_pad)
 
-        # Step 2: Set all elements to NULL (stops streaming threads).
-        for el in branch:
-            el.set_state(Gst.State.NULL)
-
-        # Step 3: Remove from the pipeline.
-        for el in branch:
-            self.pipeline.remove(el)
-
-        log.debug(
-            "Cell %d: branch torn down (%d elements removed)", self.index, len(branch)
-        )
-
-        # Step 4: Remove auxiliary elements (fakesinks for non-video RTP pads).
-        # Must happen after step 2 so rtspsrc's audio pads are deactivated
-        # before we pull the fakesinks they were linked to out of the pipeline.
+        # Step 2: Collect auxiliary elements (fakesinks for non-video RTP pads).
         aux = self._aux_elements
         self._aux_elements = []
-        for el in aux:
-            el.set_state(Gst.State.NULL)
-            self.pipeline.remove(el)
-        if aux:
-            log.debug("Cell %d: removed %d auxiliary element(s)", self.index, len(aux))
+
+        # Step 3: Enqueue all elements for NULL + remove in the background.
+        self._teardown_elements_async(branch + aux)
+
+        log.debug(
+            "Cell %d: branch teardown enqueued (%d elements)",
+            self.index,
+            len(branch) + len(aux),
+        )
 
         # Reset watchdog timestamps so the next _connect_stream call starts
         # fresh; the probe will repopulate _last_frame_time once frames flow.
@@ -338,6 +389,10 @@ class Cell:
         # the camera may stop sending after 60-120 s.
         src.set_property("protocols", 0x4)  # prefer TCP (4 = GST_RTSP_LOWER_TRANS_TCP)
         src.set_property("retry", 5)
+        # Bound TCP connection/teardown timeout.  The OS default (often 60–120 s
+        # with SYN retries) can cause set_state(NULL) to block for minutes when
+        # a camera is unreachable with a half-open connection.
+        src.set_property("tcp-timeout", self._tcp_timeout_us)  # microseconds
         # Disable RTCP/RTP timestamp divergence check.  Some cameras produce RTCP
         # sender reports whose NTP-derived timestamps drift from the RTP timestamps;
         # the default 1000 ms tolerance can cause rtspsrc to periodically reset the
@@ -937,15 +992,9 @@ class Cell:
                         old_src_pad.link(self.compositor_pad)
                     for el in old_branch:
                         el.sync_state_with_parent()
-                # Discard shadow branch.
-                for el in shadow_branch:
-                    el.set_state(Gst.State.NULL)
-                    self.pipeline.remove(el)
-                for el in shadow_aux:
-                    el.set_state(Gst.State.NULL)
-                    self.pipeline.remove(el)
-                shadow_fakesink.set_state(Gst.State.NULL)
-                self.pipeline.remove(shadow_fakesink)
+                # Discard shadow branch in background.
+                discard = list(shadow_branch) + list(shadow_aux) + [shadow_fakesink]
+                self._teardown_elements_async(discard)
                 self._preloading = False
                 return False
 
@@ -972,26 +1021,14 @@ class Cell:
             self._stream_display(self.cell_cfg.streams[next_idx], next_idx),
         )
 
-        # --- Step 9: Tear down old branch and aux elements. ---
+        # --- Step 9: Tear down old branch, aux elements, and shadow fakesink
+        #     in the background to avoid blocking the main loop. ---
+        all_old: list[Gst.Element] = []
         if old_branch:
-            for el in old_branch:
-                el.set_state(Gst.State.NULL)
-            for el in old_branch:
-                self.pipeline.remove(el)
-            log.debug(
-                "Cell %d: old branch removed (%d elements)", self.index, len(old_branch)
-            )
-        for el in old_aux:
-            el.set_state(Gst.State.NULL)
-            self.pipeline.remove(el)
-        if old_aux:
-            log.debug(
-                "Cell %d: removed %d old auxiliary element(s)", self.index, len(old_aux)
-            )
-
-        # Tear down the temporary shadow fakesink.
-        shadow_fakesink.set_state(Gst.State.NULL)
-        self.pipeline.remove(shadow_fakesink)
+            all_old.extend(old_branch)
+        all_old.extend(old_aux)
+        all_old.append(shadow_fakesink)
+        self._teardown_elements_async(all_old)
 
         self._preloading = False
         return False  # GLib.SOURCE_REMOVE — run once only
@@ -1000,8 +1037,8 @@ class Cell:
         """Tear down the shadow branch without swapping it in.
 
         Called by stop() (pipeline shutdown) or _on_preload_timeout() (fallback).
-        Cancels the fallback timer, sets all shadow elements to NULL, removes
-        them from the pipeline, and clears all _shadow_* fields.
+        Cancels the fallback timer, clears all _shadow_* fields, and enqueues
+        the elements for NULL + remove on the background teardown thread.
         """
         if self._preload_timeout_id is not None:
             GLib.source_remove(self._preload_timeout_id)
@@ -1017,29 +1054,17 @@ class Cell:
         self._shadow_fakesink = None
         self._shadow_aux_elements = []
 
-        for el in shadow_branch:
-            el.set_state(Gst.State.NULL)
-        for el in shadow_branch:
-            self.pipeline.remove(el)
-
-        for el in shadow_aux:
-            el.set_state(Gst.State.NULL)
-            self.pipeline.remove(el)
-
+        all_elements = list(shadow_branch) + list(shadow_aux)
         if shadow_fakesink is not None:
-            shadow_fakesink.set_state(Gst.State.NULL)
-            self.pipeline.remove(shadow_fakesink)
+            all_elements.append(shadow_fakesink)
 
-        n_removed = (
-            len(shadow_branch)
-            + len(shadow_aux)
-            + (1 if shadow_fakesink is not None else 0)
-        )
-        if n_removed:
+        self._teardown_elements_async(all_elements)
+
+        if all_elements:
             log.debug(
-                "Cell %d: shadow branch aborted (%d elements removed)",
+                "Cell %d: shadow branch abort enqueued (%d elements)",
                 self.index,
-                n_removed,
+                len(all_elements),
             )
 
     def _on_preload_timeout(self) -> bool:
