@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Submit Python dependencies
         uses: advanced-security/component-detection-dependency-submission-action@v0.1.1
