@@ -21,6 +21,12 @@ ExecStart=/usr/bin/python3 /opt/viewport/main.py /etc/viewport/config.yaml
 Restart=on-failure
 RestartSec=5
 
+# Disable journald per-service rate limiting.  The default limits silently
+# drop all messages from this service after a burst (e.g. reconnection
+# attempts or GStreamer warnings), and they may not resume even after the
+# burst passes.
+LogRateLimitIntervalSec=0
+
 [Install]
 WantedBy=multi-user.target
 
