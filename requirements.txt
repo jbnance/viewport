@@ -12,4 +12,4 @@
 PyGObject>=3.36.0
 
 # YAML configuration file parsing (python3-yaml on Debian)
-PyYAML>=5.4
+PyYAML>=6.0.3
