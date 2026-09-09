@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Submit Python dependencies
-        uses: advanced-security/component-detection-dependency-submission-action@v0.1.4
+        uses: advanced-security/component-detection-dependency-submission-action@v0.1.6
         with:
           # Pip and SimplePip are off by default and must be explicitly enabled.
           detectorArgs: Pip=EnableIfDefaultOff,SimplePip=EnableIfDefaultOff
