@@ -9,12 +9,11 @@
 # PyGObject from source.
 
 # GObject/GStreamer Python bindings (python3-gi / gir1.2-gstreamer-1.0 on Debian)
-PyGObject>=3.36.0
+PyGObject>=3.50.0
 
 # YAML configuration file parsing (python3-yaml on Debian)
-PyYAML>=5.4
+PyYAML>=6.0.2
 
 # Native journal logging (python3-systemd on Debian)
 # If not installed the application falls back to stderr logging.
 systemd-python>=234
-
