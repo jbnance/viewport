@@ -48,6 +48,7 @@ sudo apt install -y \
     gstreamer1.0-tools \
     python3-gi \
     python3-gst-1.0 \
+    python3-systemd \
     python3-yaml
 ```
 
@@ -134,6 +135,7 @@ Controls the output resolution, grid layout, and rotation behaviour.
 | `rows` | `3` | Number of grid rows |
 | `cols` | `2` | Number of grid columns |
 | `connector_id` | *(auto)* | DRM connector ID for `kmssink`; omit for auto-detect |
+| `tcp_timeout` | `5` | TCP timeout in seconds for RTSP connections; bounds connection setup and teardown when a camera is unreachable |
 | `preload_timeout` | `10` | Seconds to wait for a preloaded stream's first frame before skipping it |
 | `max_connection_age_hours` | `0` | Proactively refresh single-URL cell connections after this many hours, even if frames are still flowing; `0` disables. Recommended: `12`–`24` for 24/7 installs |
 
